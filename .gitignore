@@ -1,0 +1,15 @@
+/target
+/**/target
+Cargo.lock.bak
+*.sqlite
+*.sqlite-journal
+.env
+.venv
+python/.venv
+node_modules
+dist
+web-dist/
+.wisp/
+ui-tests/test-results/
+wisp-cli*.exe
+wisp-science*.exe

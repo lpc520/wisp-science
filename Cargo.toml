@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wisp-llm",
+    "crates/wisp-core",
+    "crates/wisp-tools",
+    "crates/wisp-store",
+    "crates/wisp-skills",
+    "crates/wisp-python",
+    "crates/wisp-mcp",
+    "crates/wisp-cli",
+    "src-tauri",
+]
+default-members = ["crates/wisp-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+authors = ["wisp-science contributors"]
+repository = "https://github.com/xuzhougeng/wisp-science"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+glob = "0.3"
+walkdir = "2"
+similar = "2"
+dunce = "1"
+url = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+keyring = "3"
+wisp-llm = { path = "crates/wisp-llm" }
+wisp-core = { path = "crates/wisp-core" }
+wisp-tools = { path = "crates/wisp-tools" }
+wisp-store = { path = "crates/wisp-store" }
+wisp-skills = { path = "crates/wisp-skills" }
+wisp-python = { path = "crates/wisp-python" }
+wisp-mcp = { path = "crates/wisp-mcp" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

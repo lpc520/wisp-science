@@ -1,0 +1,18 @@
+[package]
+name = "wisp-python"
+description = "uv-managed Python environment + persistent repl kernel client (Windows-adapted)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+which = "7"
+uuid = { workspace = true }
+wisp-llm = { workspace = true }
+wisp-tools = { workspace = true }

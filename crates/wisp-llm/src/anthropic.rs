@@ -1,0 +1,332 @@
+//! Anthropic Messages API provider (`/v1/messages`).
+//!
+//! Converts the shared Message model to/from Anthropic's content-block format:
+//! - system messages collapse into the top-level `system` field
+//! - tool results (our `Role::Tool`) become `user` messages with
+//!   `tool_result` content blocks
+//! - assistant tool calls become `tool_use` content blocks
+
+use crate::message::{Content, Message, Role, ToolCall, ToolSchema};
+use crate::provider::{LlmError, Provider, Result, StreamSink};
+use crate::{Completion, FunctionCall, Usage};
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+
+pub struct AnthropicProvider {
+    cfg: crate::provider::ProviderConfig,
+    client: reqwest::Client,
+}
+
+impl AnthropicProvider {
+    pub fn new(cfg: crate::provider::ProviderConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent("wisp-science")
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("reqwest client");
+        Self { cfg, client }
+    }
+
+    fn endpoint(&self) -> String {
+        let base = self.cfg.base_url.trim_end_matches('/');
+        if base.ends_with("/v1/messages") {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        }
+    }
+
+    fn headers(&self) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&self.cfg.api_key) {
+            h.insert("x-api-key", v);
+        }
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&self.cfg.anthropic_version) {
+            h.insert("anthropic-version", v);
+        }
+        h
+    }
+
+    fn build_body(&self, messages: &[Message], tools: &[ToolSchema], stream: bool) -> (String, Vec<Value>, Value) {
+        // system: concatenate all system messages.
+        let system: String = messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let mut out: Vec<Value> = vec![];
+        let mut pending_tool_results: Vec<Value> = vec![];
+
+        let flush_tool_results = |pending: &mut Vec<Value>, out: &mut Vec<Value>| {
+            if !pending.is_empty() {
+                out.push(json!({ "role": "user", "content": std::mem::take(pending) }));
+            }
+        };
+
+        for m in messages {
+            match m.role {
+                Role::System => {}
+                Role::Tool => {
+                    pending_tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                        "content": m.content.as_text(),
+                    }));
+                }
+                Role::User => {
+                    flush_tool_results(&mut pending_tool_results, &mut out);
+                    out.push(json!({ "role": "user", "content": user_content(&m.content) }));
+                }
+                Role::Assistant => {
+                    flush_tool_results(&mut pending_tool_results, &mut out);
+                    let mut blocks: Vec<Value> = vec![];
+                    let text = m.content.as_text();
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    for tc in &m.tool_calls {
+                        let input: Value = if tc.function.arguments.trim().is_empty() {
+                            json!({})
+                        } else {
+                            serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}))
+                        };
+                        blocks.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": input }));
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": " " }));
+                    }
+                    out.push(json!({ "role": "assistant", "content": blocks }));
+                }
+            }
+        }
+        flush_tool_results(&mut pending_tool_results, &mut out);
+
+        let mut body = json!({
+            "model": self.cfg.model,
+            "max_tokens": self.cfg.max_tokens,
+            "messages": out,
+            "stream": stream,
+        });
+        if !system.is_empty() {
+            body["system"] = json!(system);
+        }
+        let tools_json: Vec<Value> = tools
+            .iter()
+            .map(|t| json!({ "name": t.function.name, "description": t.function.description, "input_schema": t.function.parameters }))
+            .collect();
+        if !tools_json.is_empty() {
+            body["tools"] = json!(tools_json);
+        }
+        (system, out, body)
+    }
+
+    async fn request(&self, body: Value) -> Result<Value> {
+        let resp = self.client.post(self.endpoint()).headers(self.headers()).json(&body).send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status >= 400 {
+            return Err(LlmError::Api { status, body: text });
+        }
+        let val: Value = serde_json::from_str(&text)?;
+        Ok(val)
+    }
+}
+
+fn user_content(c: &Content) -> Value {
+    match c {
+        Content::Text(s) => json!(s),
+        Content::Parts(parts) => {
+            let arr: Vec<Value> = parts
+                .iter()
+                .map(|p| match p {
+                    crate::message::Part::Text { text, .. } => json!({ "type": "text", "text": text }),
+                    crate::message::Part::Image { image_url, .. } => {
+                        // data: URI -> {type:image, source:{type:base64, media_type, data}}
+                        if let Some((media, data)) = image_url.url.strip_prefix("data:").and_then(|s| s.split_once(",")) {
+                            let media = media.split(";").next().unwrap_or("image/png");
+                            json!({ "type": "image", "source": { "type": "base64", "media_type": media, "data": data } })
+                        } else {
+                            json!({ "type": "text", "text": image_url.url })
+                        }
+                    }
+                })
+                .collect();
+            json!(arr)
+        }
+    }
+}
+
+fn parse_completion(val: &Value) -> Completion {
+    let mut content = String::new();
+    let mut tool_calls = vec![];
+    if let Some(blocks) = val.get("content").and_then(|v| v.as_array()) {
+        for b in blocks {
+            match b.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                        content.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let input = b.get("input").cloned().unwrap_or(json!({}));
+                    tool_calls.push(ToolCall { id, kind: "function".into(), function: FunctionCall { name, arguments: input.to_string() } });
+                }
+                _ => {}
+            }
+        }
+    }
+    let finish_reason = val.get("stop_reason").and_then(|v| v.as_str()).map(|r| match r {
+        "tool_use" => "tool_calls".to_string(),
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        other => other.to_string(),
+    });
+    let usage = Usage {
+        input_tokens: val.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
+        output_tokens: val.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
+    };
+    Completion { content, reasoning: None, tool_calls, finish_reason, usage }
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
+    fn name(&self) -> &str { "anthropic" }
+    fn model(&self) -> &str { &self.cfg.model }
+
+    async fn complete(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<Completion> {
+        let (_, _, body) = self.build_body(messages, tools, false);
+        let val = self.request(body).await?;
+        Ok(parse_completion(&val))
+    }
+
+    async fn stream(&self, messages: &[Message], tools: &[ToolSchema], sink: &mut dyn StreamSink) -> Result<Completion> {
+        let (_, _, body) = self.build_body(messages, tools, true);
+        let resp = self.client.post(self.endpoint()).headers(self.headers()).json(&body).send().await?;
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, body: text });
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        // index -> (type, id, name, input_json_accumulator, text_accumulator)
+        let mut blocks: std::collections::BTreeMap<usize, BlockAcc> = std::collections::BTreeMap::new();
+        let mut content = String::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage = Usage::default();
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            buf.push_str(std::str::from_utf8(&bytes).unwrap_or(""));
+            while let Some(idx) = buf.find("\n\n") {
+                let event = buf[..idx].to_string();
+                buf.drain(..idx + 2);
+                let (etype, data) = parse_sse_event(&event);
+                if data.is_empty() { continue; }
+                let Ok(val) = serde_json::from_str::<Value>(&data) else { continue };
+                match etype.as_str() {
+                    "message_start" => {
+                        if let Some(u) = val.pointer("/message/usage") {
+                            usage.input_tokens = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            usage.output_tokens = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        }
+                    }
+                    "content_block_start" => {
+                        let i = val.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let blk = val.get("content_block").cloned().unwrap_or(Value::Null);
+                        let kind = blk.get("type").and_then(|v| v.as_str()).unwrap_or("text").to_string();
+                        let id = blk.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = blk.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        blocks.insert(i, BlockAcc { kind, id, name, input: String::new(), text: String::new() });
+                    }
+                    "content_block_delta" => {
+                        let i = val.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let Some(delta) = val.get("delta") else { continue };
+                        let Some(b) = blocks.get_mut(&i) else { continue };
+                        match delta.get("type").and_then(|v| v.as_str()) {
+                            Some("text_delta") => {
+                                if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                    b.text.push_str(t);
+                                    content.push_str(t);
+                                    sink.on_text(t);
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(p) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                    b.input.push_str(p);
+                                    sink.on_tool_call(i, &b.name, &b.input);
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                    sink.on_reasoning(t);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(fr) = val.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                            finish_reason = Some(match fr {
+                                "tool_use" => "tool_calls".to_string(),
+                                "end_turn" | "stop_sequence" => "stop".to_string(),
+                                o => o.to_string(),
+                            });
+                        }
+                        if let Some(u) = val.get("usage") {
+                            if let Some(o) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                                usage.output_tokens = o;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sink.on_usage(usage.clone());
+
+        let tool_calls: Vec<ToolCall> = blocks
+            .into_iter()
+            .filter(|(_, b)| b.kind == "tool_use")
+            .map(|(_, b)| ToolCall {
+                id: b.id,
+                kind: "function".into(),
+                function: FunctionCall { name: b.name, arguments: b.input },
+            })
+            .collect();
+
+        if content.is_empty() && tool_calls.is_empty() && finish_reason.is_none() {
+            return Err(LlmError::Incomplete);
+        }
+        Ok(Completion { content, reasoning: None, tool_calls, finish_reason, usage })
+    }
+}
+
+struct BlockAcc {
+    kind: String,
+    id: String,
+    name: String,
+    input: String,
+    text: String,
+}
+
+fn parse_sse_event(event: &str) -> (String, String) {
+    let mut etype = String::new();
+    let mut data = String::new();
+    for line in event.lines() {
+        if let Some(t) = line.strip_prefix("event:") {
+            etype = t.trim().to_string();
+        } else if let Some(d) = line.strip_prefix("data:") {
+            if !data.is_empty() { data.push('\n'); }
+            data.push_str(d.trim());
+        }
+    }
+    (etype, data)
+}
