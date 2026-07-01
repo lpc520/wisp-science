@@ -3,6 +3,12 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path (Split-Path -Parent $root) "web-dist"
 $dst = Join-Path $root "vendor"
+
+if (-not (Test-Path $src)) {
+  Write-Host "web-dist missing; using committed ui/vendor"
+  exit 0
+}
+
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 
 $files = @(
@@ -23,7 +29,10 @@ foreach ($f in $files) {
 }
 
 # KaTeX fonts (referenced by katex css)
-Get-ChildItem (Join-Path $src "assets") -Filter "KaTeX_*" | ForEach-Object {
-  Copy-Item $_.FullName (Join-Path $dst $_.Name) -Force
+$assetsDir = Join-Path $src "assets"
+if (Test-Path $assetsDir) {
+  Get-ChildItem $assetsDir -Filter "KaTeX_*" | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $dst $_.Name) -Force
+  }
 }
 Write-Host "vendor synced to $dst"
