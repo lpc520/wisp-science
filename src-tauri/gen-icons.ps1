@@ -1,3 +1,7 @@
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
-cargo tauri icon "../ui/logo.svg"
+Push-Location $PSScriptRoot
+try {
+    cargo tauri icon "../ui/logo.svg"
+} finally {
+    Pop-Location
+}
