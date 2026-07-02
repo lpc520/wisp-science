@@ -115,9 +115,9 @@ Then the agent can call that server's tools (e.g. PubMed search) directly.
 `seed/` ships four pre-baked example sessions (CRISPR screen, enzyme
 engineering, extremophile, immunotherapy) recorded from the upstream agent.
 In the desktop app, **Open demo** lists them and opens one as a read-only
-User + Assistant transcript (the agent's final report, with figure markers
-rendered as `[caption (figure)]` placeholders). It's a quick way to see the
-kind of work wisp-science is built for without spending API budget.
+User + Assistant transcript. Bundled `assets_*.tar.gz` archives are extracted
+into the workspace on open so figures and data files in the right panel preview
+correctly.
 
 ## Testing
 

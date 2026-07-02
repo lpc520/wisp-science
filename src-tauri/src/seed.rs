@@ -1,13 +1,13 @@
 //! Bundled demo loader — reads the upstream `seed/manifest_*.json` session
 //! recordings and presents each as a pre-baked User + Assistant demo the UI
-//! can open. The manifest's `{{artifact:VID}}` image markers are cleaned into
-//! readable placeholders (the figures themselves live inside `assets_*.tar.gz`
-//! and aren't unpacked for the MVP viewer).
+//! can open. Figure/data files live in paired `assets_*.tar.gz` archives and
+//! are extracted into the workspace when a demo is opened.
 
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Bundled demo manifests (`seed/`).
@@ -69,6 +69,36 @@ pub fn list_demos() -> Vec<DemoInfo> {
     out
 }
 
+fn assets_tarball(id: &str) -> Option<PathBuf> {
+    let dir = bundled_dir()?;
+    let suffix = id.strip_prefix("manifest_")?;
+    let path = dir.join(format!("assets_{suffix}.tar.gz"));
+    path.is_file().then_some(path)
+}
+
+/// Extract bundled demo files into `dest` (workspace root), flattening the
+/// `example_*` folder inside each tarball so transcript filenames resolve.
+pub fn extract_demo_assets(id: &str, dest: &Path) -> Result<(), String> {
+    let tar_path = assets_tarball(id)
+        .ok_or_else(|| format!("no bundled assets for demo '{id}'"))?;
+    std::fs::create_dir_all(dest).map_err(|e| format!("create demo dest: {e}"))?;
+    let file = File::open(&tar_path).map_err(|e| format!("open {}: {e}", tar_path.display()))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    for entry in archive.entries().map_err(|e| format!("read tar: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        let path = entry.path().map_err(|e| format!("tar path: {e}"))?;
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let out = dest.join(name);
+        entry.unpack(&out).map_err(|e| format!("unpack {}: {e}", out.display()))?;
+    }
+    Ok(())
+}
+
 /// Load one demo by id (the manifest file stem, e.g. `manifest_crispr_screen`).
 pub fn load_demo(id: &str) -> Option<Demo> {
     let dir = bundled_dir()?;
@@ -91,6 +121,18 @@ pub fn load_demo(id: &str) -> Option<Demo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_enzyme_demo_assets() {
+        let tmp = std::env::temp_dir().join(format!("wisp-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let id = "manifest_enzyme_engineering";
+        extract_demo_assets(id, &tmp).expect("extract enzyme demo assets");
+        assert!(tmp.join("top5_mut_H224N.png").is_file());
+        assert!(tmp.join("is621_esmfold.pdb").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn lists_and_loads_bundled_demos() {

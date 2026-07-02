@@ -541,7 +541,8 @@ fn list_demos() -> Vec<seed::DemoInfo> {
 }
 
 #[tauri::command]
-fn load_demo(id: String) -> Result<seed::Demo, String> {
+fn load_demo(state: State<'_, AppState>, id: String) -> Result<seed::Demo, String> {
+    seed::extract_demo_assets(&id, &state.root)?;
     seed::load_demo(&id).ok_or_else(|| format!("demo '{id}' not found"))
 }
 

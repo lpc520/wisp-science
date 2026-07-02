@@ -40,6 +40,8 @@ similar = "2"
 dunce = "1"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+flate2 = "1"
+tar = "0.4"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
 keyring = "3"
 wisp-llm = { path = "crates/wisp-llm" }

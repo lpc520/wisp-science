@@ -14,3 +14,4 @@ web-dist/
 ui-tests/test-results/
 wisp-cli*.exe
 wisp-science*.exe
+/runtime
