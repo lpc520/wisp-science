@@ -44,7 +44,6 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           projectPath: src-tauri
           tauriScript: cargo tauri
@@ -53,5 +52,4 @@ jobs:
           releaseBodyPath: .github/release-notes/${{ github.ref_name }}.md
           releaseDraft: false
           prerelease: true
-          includeUpdaterArtifacts: true
           args: --bundles msi,nsis

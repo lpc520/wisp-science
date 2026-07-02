@@ -814,17 +814,8 @@ fn get_bootstrap_status(state: State<'_, AppState>) -> BootstrapStatus {
 }
 
 #[tauri::command]
-async fn check_for_updates(app: AppHandle) -> Result<String, String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| format!("{e}"))?;
-    match updater.check().await {
-        Ok(Some(update)) => {
-            update.download_and_install(|_, _| {}, || {}).await.map_err(|e| format!("{e}"))?;
-            Ok(format!("Updated to v{}. Restart the app.", update.version))
-        }
-        Ok(None) => Ok("You are on the latest version.".into()),
-        Err(e) => Err(format!("{e}")),
-    }
+async fn check_for_updates() -> Result<String, String> {
+    Ok("In-app auto-update is disabled until release signing is configured. Download new builds from GitHub Releases.".into())
 }
 
 #[tauri::command]
@@ -857,7 +848,6 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if let Ok(res) = app.path().resource_dir() {
                 wisp_paths::set_resource_root(res);
