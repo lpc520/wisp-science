@@ -18,6 +18,10 @@ pub trait Output: Send + Sync {
     fn stdout_chunk(&self, _chunk: &str) {}
     /// Blocking confirmation prompt for destructive actions.
     fn confirm(&self, _message: &str) -> bool { true }
+    /// Fired once per message appended to the context during a turn (user,
+    /// assistant, tool). Lets the host persist incrementally so a crash or a
+    /// mid-turn "new session" doesn't lose the whole turn. Default: no-op.
+    fn on_message(&self, _msg: &wisp_llm::Message) {}
 }
 
 /// A silent output for tests / non-interactive runs that auto-approves.
@@ -28,11 +32,20 @@ impl Output for NullOutput {}
 pub struct ToolEnvAdapter<'a> {
     root: std::path::PathBuf,
     out: &'a dyn Output,
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> ToolEnvAdapter<'a> {
     pub fn new(root: std::path::PathBuf, out: &'a dyn Output) -> Self {
-        Self { root, out }
+        Self { root, out, cancel: None }
+    }
+    /// Like `new`, but tools can poll `is_cancelled()` to stop mid-execution.
+    pub fn with_cancel(
+        root: std::path::PathBuf,
+        out: &'a dyn Output,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    ) -> Self {
+        Self { root, out, cancel: Some(cancel) }
     }
 }
 
@@ -40,6 +53,10 @@ impl<'a> ToolEnvAdapter<'a> {
 impl<'a> wisp_tools::ToolEnv for ToolEnvAdapter<'a> {
     fn project_root(&self) -> &std::path::Path { &self.root }
     async fn confirm(&self, message: &str) -> bool { self.out.confirm(message) }
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
     async fn emit(&self, event: wisp_tools::ToolEvent) {
         match event {
             wisp_tools::ToolEvent::Call { name, preview } => self.out.tool_call(&name, &preview),

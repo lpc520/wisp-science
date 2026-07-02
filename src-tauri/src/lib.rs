@@ -2,7 +2,7 @@
 //! events to the webview, plus a settings/confirm surface.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -177,6 +177,10 @@ struct Settings {
     has_api_key: bool,
     #[serde(default = "default_locale")]
     locale: String,
+    /// Where the workspace/data root lives. Empty = platform default
+    /// (Documents/wisp-science). Applied on next launch (#6, #13).
+    #[serde(default)]
+    workspace_dir: String,
 }
 
 fn default_locale() -> String {
@@ -219,6 +223,10 @@ struct TauriOutput {
     app: AppHandle,
     frame_id: String,
     confirm: Arc<StdMutex<Option<std::sync::mpsc::Sender<bool>>>>,
+    /// Incremental-persistence sink: each message the turn produces is sent here
+    /// and written to SQLite by a background task, so a crash or mid-turn "new
+    /// session" no longer discards the whole turn. `None` disables it.
+    persist: Option<tokio::sync::mpsc::UnboundedSender<Message>>,
 }
 
 impl TauriOutput {
@@ -260,6 +268,11 @@ impl Output for TauriOutput {
         // Block until the UI responds; default to deny on timeout/missing.
         rx.recv_timeout(std::time::Duration::from_secs(180)).unwrap_or(false)
     }
+    fn on_message(&self, msg: &Message) {
+        if let Some(tx) = &self.persist {
+            let _ = tx.send(msg.clone());
+        }
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -276,6 +289,20 @@ fn normalized_provider(provider: &str) -> String {
 
 fn non_empty_setting(value: Option<String>, fallback: impl FnOnce() -> String) -> String {
     value.filter(|v| !v.trim().is_empty()).unwrap_or_else(fallback)
+}
+
+/// Pick the workspace root: env override, then the saved setting, then the
+/// platform default — the first non-empty candidate we can create wins.
+fn resolve_workspace(env: Option<String>, stored: Option<String>, default: PathBuf) -> PathBuf {
+    for cand in [env, stored].into_iter().flatten() {
+        let cand = cand.trim();
+        if cand.is_empty() { continue; }
+        let p = PathBuf::from(cand);
+        if std::fs::create_dir_all(&p).is_ok() {
+            return p;
+        }
+    }
+    default
 }
 
 async fn load_locale(store: &Store) -> String {
@@ -443,8 +470,6 @@ async fn send_message(state: State<'_, AppState>, app: AppHandle, message: Strin
     let max_context = state.store.get_setting("max_context").await.ok().flatten().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_000_000);
     let max_iter = state.store.get_setting("max_iter").await.ok().flatten().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
 
-    let output = TauriOutput { app: app.clone(), frame_id: turn_id.clone(), confirm: state.confirm.clone() };
-
     let mut guard = state.agent.lock().await;
     if guard.is_none() {
         let mut agent = Agent::new(cfg.clone(), state.skills.clone(), state.memory.clone(), state.root.clone(), max_context, max_iter);
@@ -473,23 +498,71 @@ async fn send_message(state: State<'_, AppState>, app: AppHandle, message: Strin
     let agent = guard.as_mut().unwrap();
     state.cancel.store(false, Ordering::Relaxed);
 
+    // Incremental persistence: a background task appends each message the turn
+    // produces to SQLite as it arrives (via TauriOutput::on_message), so a crash
+    // or a mid-turn "new session" no longer loses the whole turn (#14, #15). The
+    // task owns the running seq, so it stays correct even if the in-memory
+    // context is compacted mid-turn.
+    //
+    // First flush any messages already in the context but not yet persisted
+    // (e.g. a system prompt seeded here or by `new_session`), so the incremental
+    // seq lines up with what a later reload expects.
+    let (persist_frame, start_seq) = {
+        let mut sess = state.session.lock().await;
+        let frame = sess.frame_id.clone();
+        if let Some(frame_id) = &frame {
+            let start = sess.last_seq as usize;
+            if start < agent.ctx.messages.len() {
+                let mut seq = sess.last_seq;
+                for m in &agent.ctx.messages[start..] {
+                    seq += 1;
+                    let _ = state.store.append_message(frame_id, seq, m).await;
+                }
+                sess.last_seq = agent.ctx.messages.len() as i64;
+            }
+        }
+        (frame, sess.last_seq)
+    };
+    let (persist_handle, persist_tx) = match persist_frame {
+        Some(frame_id) => {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            let store = state.store.clone();
+            let mut seq = start_seq;
+            let handle = tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    seq += 1;
+                    if let Err(e) = store.append_message(&frame_id, seq, &msg).await {
+                        tracing::warn!("incremental persist seq {seq} failed: {e}");
+                    }
+                }
+                seq
+            });
+            (Some(handle), Some(tx))
+        }
+        None => (None, None),
+    };
+
+    let output = TauriOutput {
+        app: app.clone(),
+        frame_id: turn_id.clone(),
+        confirm: state.confirm.clone(),
+        persist: persist_tx,
+    };
+
     let result = agent.run(&message, &output, Some(state.cancel.as_ref())).await;
     agent.ctx.clear_runtime_injections();
 
-    // Persist only the messages added this turn to SQLite.
-    {
-        let mut sess = state.session.lock().await;
-        if let Some(frame_id) = sess.frame_id.clone() {
-            let start = sess.last_seq as usize;
-            let mut seq = sess.last_seq;
-            for m in &agent.ctx.messages[start..] {
-                seq += 1;
-                if let Err(e) = state.store.append_message(&frame_id, seq, m).await {
-                    tracing::warn!("persist message {seq} failed: {e}");
-                    break;
-                }
+    // Close the persist channel and wait for the task to flush; its final seq is
+    // the authoritative persisted count.
+    drop(output);
+    if let Some(handle) = persist_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            Ok(Ok(final_seq)) => { state.session.lock().await.last_seq = final_seq; }
+            other => {
+                tracing::warn!("persist task did not finish cleanly: {other:?}");
+                let mut sess = state.session.lock().await;
+                sess.last_seq = agent.ctx.messages.len() as i64;
             }
-            sess.last_seq = agent.ctx.messages.len() as i64;
         }
     }
     drop(guard);
@@ -513,6 +586,10 @@ fn stop_agent(state: State<'_, AppState>) {
 
 #[tauri::command]
 async fn new_session(state: State<'_, AppState>) -> Result<(), String> {
+    // If a turn is mid-flight it holds the agent lock for its whole duration.
+    // Signal cancellation first so it interrupts (killing any running child)
+    // and releases the lock, instead of this command blocking for minutes (#15).
+    state.cancel.store(true, Ordering::Relaxed);
     let mut guard = state.agent.lock().await;
     // Reset even when the agent hasn't been created yet (lazy init in
     // send_message), otherwise the next message lands in the old frame.
@@ -611,7 +688,8 @@ fn confirm_response(state: State<'_, AppState>, approved: bool) -> Result<(), St
 async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     let (provider, api_url, model, api_key) = load_settings(&state.store).await;
     let locale = load_locale(&state.store).await;
-    Ok(Settings { provider, api_url, model, has_api_key: !api_key.is_empty(), locale })
+    let workspace_dir = state.store.get_setting("workspace_dir").await.ok().flatten().unwrap_or_default();
+    Ok(Settings { provider, api_url, model, has_api_key: !api_key.is_empty(), locale, workspace_dir })
 }
 
 #[tauri::command]
@@ -641,6 +719,22 @@ async fn set_settings(state: State<'_, AppState>, settings: Settings) -> Result<
         _ => "en",
     };
     state.store.set_setting("locale", locale).await.map_err(|e| format!("{e}"))?;
+
+    // Workspace directory: persist an absolute, creatable path. Takes effect on
+    // next launch (AppState.root is fixed at startup — restart, not hot-swap).
+    let workspace_dir = settings.workspace_dir.trim();
+    if workspace_dir.is_empty() {
+        // Empty clears the override → back to the platform default next launch.
+        state.store.set_setting("workspace_dir", "").await.map_err(|e| format!("{e}"))?;
+    } else {
+        let ws = Path::new(workspace_dir);
+        if !ws.is_absolute() {
+            return Err("Workspace directory must be an absolute path.".into());
+        }
+        std::fs::create_dir_all(ws).map_err(|e| format!("Failed to create workspace directory: {e}"))?;
+        state.store.set_setting("workspace_dir", workspace_dir).await.map_err(|e| format!("{e}"))?;
+    }
+
     // Reset the cached agent so the next turn picks up the new provider.
     *state.agent.lock().await = None;
     Ok(())
@@ -1021,16 +1115,35 @@ pub fn run() {
                 .unwrap_or_else(|_| PathBuf::from(".wisp"))
                 .join("wisp-science");
             std::fs::create_dir_all(&app_data).expect("create app data dir");
-            let workspace = app
+            let db_path = app_data.join("wisp.sqlite");
+            let store = tauri::async_runtime::block_on(Store::open(&db_path)).expect("open store");
+            let _ = tauri::async_runtime::block_on(store.create_project("default", "Workspace"));
+
+            // Resolve the workspace/data root: env override, then the saved
+            // setting, then the platform default (Documents/wisp-science). Lets
+            // users move it off C:/OneDrive (#6, #13); applies on next launch
+            // since AppState.root is fixed for the life of the process.
+            let default_workspace = app
                 .path()
                 .document_dir()
                 .map(|d| d.join("wisp-science"))
                 .unwrap_or_else(|_| app_data.join("workspace"));
-            std::fs::create_dir_all(&workspace).expect("create workspace dir");
-
-            let db_path = app_data.join("wisp.sqlite");
-            let store = tauri::async_runtime::block_on(Store::open(&db_path)).expect("open store");
-            let _ = tauri::async_runtime::block_on(store.create_project("default", "Workspace"));
+            let workspace = resolve_workspace(
+                std::env::var("WISP_WORKSPACE").ok(),
+                tauri::async_runtime::block_on(store.get_setting("workspace_dir")).ok().flatten(),
+                default_workspace,
+            );
+            // Never panic the app on launch if the resolved workspace turns out
+            // unwritable (e.g. a saved path on an offline OneDrive/external
+            // drive): fall back to app_data, which we already created above.
+            let workspace = if std::fs::create_dir_all(&workspace).is_ok() {
+                workspace
+            } else {
+                let fallback = app_data.join("workspace");
+                tracing::warn!("workspace {:?} not writable; using {:?}", workspace, fallback);
+                std::fs::create_dir_all(&fallback).expect("create fallback workspace dir");
+                fallback
+            };
             let skills = Arc::new(SkillIndex::load(&skill_paths(&workspace)));
             let memory = Arc::new(MemoryManager::new(&workspace));
             let bootstrap = StdMutex::new(initial_bootstrap(&app_data, &workspace, skills.all().len()));
@@ -1082,4 +1195,41 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wisp");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_workspace_prefers_env_then_setting_then_default() {
+        let default = PathBuf::from("/nonexistent/wisp/default");
+        // Blank/whitespace candidates are skipped → default wins (never created).
+        assert_eq!(
+            resolve_workspace(Some("   ".into()), Some(String::new()), default.clone()),
+            default
+        );
+        assert!(!default.exists());
+
+        let base = std::env::temp_dir().join(format!("wisp_ws_test_{}", std::process::id()));
+        let env_dir = base.join("env");
+        let set_dir = base.join("set");
+        // A creatable env path wins over the setting, and gets created.
+        assert_eq!(
+            resolve_workspace(
+                Some(env_dir.to_string_lossy().into_owned()),
+                Some(set_dir.to_string_lossy().into_owned()),
+                default.clone(),
+            ),
+            env_dir
+        );
+        assert!(env_dir.exists());
+        // Falls through to the setting when env is absent.
+        assert_eq!(
+            resolve_workspace(None, Some(set_dir.to_string_lossy().into_owned()), default),
+            set_dir
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

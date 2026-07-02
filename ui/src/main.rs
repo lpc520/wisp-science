@@ -217,6 +217,8 @@ struct Settings {
     has_api_key: bool,
     #[serde(default)]
     locale: String,
+    #[serde(default)]
+    workspace_dir: String,
 }
 
 impl Default for Settings {
@@ -227,6 +229,7 @@ impl Default for Settings {
             model: "deepseek-v4-pro".into(),
             has_api_key: false,
             locale: Locale::En.code().into(),
+            workspace_dir: String::new(),
         }
     }
 }
@@ -1817,18 +1820,39 @@ fn App() -> impl IntoView {
     };
 
     let new_session = move |_| {
-        items.set(vec![]);
         // ponytail: mid-upload switch can still re-add chips when the upload
         // finishes; add a generation guard if that ever bites.
-        attachments.set(vec![]);
-        active_session.set(None);
-        sel_artifact.set(0);
-        open_file.set(None);
-        right_tab.set(RightTab::Artifacts);
-        spawn_local(async move {
-            let _ = invoke("new_session", JsValue::UNDEFINED).await;
-            refresh_sessions(sessions);
-        });
+        if busy.get() {
+            // A turn is running: stop it first so the backend cancels it and
+            // releases the agent lock, then create the session and clear the
+            // view. No optimistic wipe that strands a running turn behind an
+            // empty chat (#15).
+            spawn_local(async move {
+                let _ = invoke("stop_agent", JsValue::UNDEFINED).await;
+                let _ = invoke("new_session", JsValue::UNDEFINED).await;
+                items.set(vec![]);
+                attachments.set(vec![]);
+                active_session.set(None);
+                sel_artifact.set(0);
+                open_file.set(None);
+                right_tab.set(RightTab::Artifacts);
+                // We abandoned the running turn; clear the spinner ourselves
+                // rather than waiting on the cancelled turn's Done/Error event.
+                busy.set(false);
+                refresh_sessions(sessions);
+            });
+        } else {
+            items.set(vec![]);
+            attachments.set(vec![]);
+            active_session.set(None);
+            sel_artifact.set(0);
+            open_file.set(None);
+            right_tab.set(RightTab::Artifacts);
+            spawn_local(async move {
+                let _ = invoke("new_session", JsValue::UNDEFINED).await;
+                refresh_sessions(sessions);
+            });
+        }
     };
 
     let start_env_setup = {
@@ -2494,6 +2518,13 @@ fn App() -> impl IntoView {
                     <label>{move || t(locale.get(), "settings.api_key")}
                         <input on:input=move|ev| api_key_input.set(event_target_input(&ev).value())
                             prop:value={move || api_key_input.get()} type="password" />
+                    </label>
+                    <label>{move || t(locale.get(), "settings.workspace_dir")}
+                        <input on:input=move|ev| settings.update(|s| {
+                                s.workspace_dir = event_target_input(&ev).value();
+                            })
+                            prop:value={move || settings.get().workspace_dir}
+                            placeholder="D:\\wisp-science" />
                     </label>
                     <span class="hint">{move || t(locale.get(), "settings.tip")}</span>
                     {move || settings_message.get().map(|(ok, text)| view! {
