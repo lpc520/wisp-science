@@ -47,14 +47,9 @@ jobs:
         with:
           projectPath: src-tauri
           tauriScript: cargo tauri
-          uploadWorkflowArtifacts: true
           tagName: ${{ github.ref_name }}
           releaseName: wisp-science ${{ github.ref_name }}
-          releaseBody: |
-            Windows desktop installers for wisp-science.
-
-            - `.msi` — WiX installer
-            - `*-setup.exe` — NSIS installer
+          releaseBodyPath: .github/release-notes/${{ github.ref_name }}.md
           releaseDraft: false
-          prerelease: false
+          prerelease: true
           args: --bundles msi,nsis
