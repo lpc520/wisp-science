@@ -871,40 +871,14 @@ async fn register_artifact(
     Ok(ArtifactInfo { id, name: filename, kind: mime, path: storage, ts })
 }
 
-/// Release builds: hide WebView2's native context menu (Inspect, etc.), like operon/web-dist.
-/// Debug / `cargo tauri dev` keeps the default menu for DevTools.
-#[cfg(not(debug_assertions))]
-const BLOCK_CONTEXT_MENU_SCRIPT: &str = r#"
-    (function () {
-        var root = document.documentElement;
-        if (root.dataset.wispContextMenuBlocked) return;
-        root.dataset.wispContextMenuBlocked = "1";
-        document.addEventListener("contextmenu", function (e) { e.preventDefault(); }, true);
-    })();
-"#;
-
-#[cfg(not(debug_assertions))]
-fn install_context_menu_guard(window: &tauri::WebviewWindow) {
-    let _ = window.eval(BLOCK_CONTEXT_MENU_SCRIPT);
-}
-
-#[cfg(not(debug_assertions))]
-fn block_native_context_menu(app: &tauri::AppHandle) {
+/// Tell the webview whether we're in dev (keep native context menu / DevTools).
+fn set_dev_flag(app: &tauri::AppHandle) {
+    let dev = cfg!(debug_assertions);
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    install_context_menu_guard(&window);
-    let reload = window.clone();
-    window.on_page_load(move |_, payload| {
-        use tauri::webview::PageLoadEvent;
-        if payload.event() == PageLoadEvent::Finished {
-            install_context_menu_guard(&reload);
-        }
-    });
+    let _ = window.eval(&format!("window.__WISP_DEV__ = {};", dev));
 }
-
-#[cfg(debug_assertions)]
-fn block_native_context_menu(_app: &tauri::AppHandle) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -954,7 +928,7 @@ pub fn run() {
                 cancel: Arc::new(AtomicBool::new(false)),
             };
             app.manage(state);
-            block_native_context_menu(app.handle());
+            set_dev_flag(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

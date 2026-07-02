@@ -1,7 +1,9 @@
+mod context_menu;
 mod i18n;
 
+use context_menu::{ContextMenuPortal, CtxMenu};
 use i18n::{localize_backend, set_document_lang, tab_count, tf, t, use_locale, Locale};
-use leptos::*;
+use leptos::{ev, window_event_listener, *};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_DOM_ID: AtomicUsize = AtomicUsize::new(0);
@@ -155,6 +157,26 @@ fn settings_required_error_key(cfg: &Settings, key: &str) -> Option<&'static str
 fn is_stored_key_placeholder(key: &str, locale: Locale) -> bool {
     let stored = t(locale, "settings.stored_key");
     key.starts_with(&stored) || key.starts_with("(stored")
+}
+
+fn should_close_right_pane_on_escape(ev: &web_sys::KeyboardEvent) -> bool {
+    if ev.default_prevented() || ev.is_composing() {
+        return false;
+    }
+    let Some(window) = web_sys::window() else { return false };
+    let Some(document) = window.document() else { return false };
+    let target = ev.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+    let Some(node) = target.as_ref() else { return true };
+    if !node.is_connected() {
+        return false;
+    }
+    if let Ok(Some(panel)) = document.query_selector(".rightpane") {
+        if panel.contains(Some(node)) {
+            return true;
+        }
+    }
+    document.body().as_ref().is_some_and(|body| node.is_same_node(Some(body)))
+        || document.document_element().as_ref().is_some_and(|html| node.is_same_node(Some(html)))
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1227,7 +1249,7 @@ fn App() -> impl IntoView {
         });
     };
 
-    let load_session = move |id: String| {
+    let load_session = Callback::new(move |id: String| {
         active_session.set(Some(id.clone()));
         sel_artifact.set(0);
         busy.set(true);
@@ -1238,7 +1260,7 @@ fn App() -> impl IntoView {
             }
             busy.set(false);
         });
-    };
+    });
 
     let open_demos = move |_| {
         let d = demos;
@@ -1276,11 +1298,13 @@ fn App() -> impl IntoView {
         });
     };
 
-    let approve = move |v: bool| move |_| {
+    let respond_confirm = Callback::new(move |approved: bool| {
         confirm_state.set(None);
-        let arg = to_value(&serde_json::json!({ "approved": v })).unwrap();
+        let arg = to_value(&serde_json::json!({ "approved": approved })).unwrap();
         spawn_local(async move { let _ = invoke("confirm_response", arg).await; });
-    };
+    });
+
+    let approve = move |v: bool| move |_| respond_confirm.call(v);
 
     let on_resize_start = move |ev: web_sys::MouseEvent| {
         ev.prevent_default();
@@ -1311,13 +1335,89 @@ fn App() -> impl IntoView {
         });
     };
 
-    let dismiss_onboard = move |_| {
+    let dismiss_onboarding = Callback::new(move |_| {
         show_onboarding.set(false);
         spawn_local(async move { let _ = invoke("dismiss_onboarding", JsValue::UNDEFINED).await; });
+    });
+    let dismiss_onboard = move |_| dismiss_onboarding.call(());
+
+    let ctx_menu = create_rw_signal::<Option<CtxMenu>>(None);
+    let open_session = load_session.clone();
+    let on_ctx_pick = Callback::new(move |(action, payload): (String, String)| {
+        if let Some(id) = context_menu::session_action(&action, &payload) {
+            open_session.call(id);
+        }
+        context_menu::run_action(&action, &payload, copy_text);
+    });
+    let on_context_menu = move |ev: web_sys::MouseEvent| {
+        if context_menu::dev_mode() {
+            return;
+        }
+        ev.prevent_default();
+        let loc = locale.get();
+        if let Some(menu) = context_menu::build(&ev, loc) {
+            ctx_menu.set(if menu.items.is_empty() { None } else { Some(menu) });
+        }
     };
 
+    window_event_listener(ev::keydown, move |ev| {
+        let Some(ev) = ev.dyn_ref::<web_sys::KeyboardEvent>() else { return };
+        if ev.key() != "Escape" || ev.default_prevented() || ev.is_composing() {
+            return;
+        }
+
+        if confirm_state.get().is_some() {
+            ev.prevent_default();
+            respond_confirm.call(false);
+            return;
+        }
+        if ctx_menu.get().is_some() {
+            ev.prevent_default();
+            ctx_menu.set(None);
+            return;
+        }
+        if show_onboarding.get() {
+            ev.prevent_default();
+            if onboard_step.get() > 0 {
+                onboard_step.update(|s| *s = s.saturating_sub(1));
+            } else {
+                dismiss_onboarding.call(());
+            }
+            return;
+        }
+        if show_settings.get() && !settings_busy.get() {
+            ev.prevent_default();
+            show_settings.set(false);
+            return;
+        }
+        if show_demos.get() {
+            ev.prevent_default();
+            show_demos.set(false);
+            return;
+        }
+        if show_files.get() {
+            ev.prevent_default();
+            show_files.set(false);
+            return;
+        }
+        if show_capabilities.get() {
+            ev.prevent_default();
+            show_capabilities.set(false);
+            return;
+        }
+        if dragging.get() {
+            ev.prevent_default();
+            dragging.set(false);
+            return;
+        }
+        if show_right.get() && should_close_right_pane_on_escape(ev) {
+            ev.prevent_default();
+            show_right.set(false);
+        }
+    });
+
     view! {
-        <div class="app">
+        <div class="app" on:contextmenu=on_context_menu>
         <aside class="sidebar" class:collapsed=move || !show_sidebar.get()>
             <div class="proj">
                 <span class="logo"></span>
@@ -1340,11 +1440,16 @@ fn App() -> impl IntoView {
                         list.into_iter().map(|s| {
                             let id = s.id.clone();
                             let id_active = id.clone();
+                            let id_attr = id.clone();
                             let title = if s.title.trim().is_empty() { t(loc, "sidebar.untitled").into() } else { s.title.clone() };
+                            let title_attr = title.clone();
+                            let open = load_session.clone();
                             view! {
                                 <button class="side-item ses"
                                     class:active=move || active_session.get().as_deref() == Some(id_active.as_str())
-                                    on:click=move |_| load_session(id.clone())>
+                                    data-session-id=id_attr
+                                    data-session-title=title_attr
+                                    on:click=move |_| open.call(id.clone())>
                                     <span class="dot"></span>
                                     <span class="ses-title">{title}</span>
                                 </button>
@@ -1425,6 +1530,7 @@ fn App() -> impl IntoView {
             <div class="composer">
                 <div class="composer-inner">
                     <textarea
+                        id="composer-input"
                         prop:value={move || input.get()}
                         on:input=move|ev| input.set(event_target_value(&ev))
                         on:keydown=on_send
@@ -1483,8 +1589,10 @@ fn App() -> impl IntoView {
                                 let sel = sel_artifact.get().min(arts.len() - 1);
                                 let tiles = arts.iter().enumerate().map(|(i, a)| {
                                     let meta = artifact_meta(a, loc);
+                                    let name = a.name.clone();
                                     view! {
                                         <button class="rp-tile" class:active=move || sel_artifact.get() == i
+                                            data-artifact-name=name.clone()
                                             on:click=move |_| sel_artifact.set(i)>
                                             <span class="rp-tile-name">{a.name.clone()}</span>
                                             <span class="rp-tile-meta">{meta}</span>
@@ -1848,6 +1956,7 @@ fn App() -> impl IntoView {
                 </div>
             }.into_view()
         })}
+        <ContextMenuPortal menu=ctx_menu.read_only() set_menu=ctx_menu.write_only() on_pick=on_ctx_pick />
         </div>
     }
 }
