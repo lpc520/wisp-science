@@ -236,6 +236,17 @@ struct MemoryFile {
 }
 
 #[derive(Deserialize, Clone)]
+struct BootstrapStatus {
+    skills_loaded: usize,
+    python_ok: bool,
+    mcp_catalog: usize,
+    uv_ok: bool,
+    app_version: String,
+    workspace: String,
+    errors: Vec<String>,
+}
+
+#[derive(Deserialize, Clone)]
 struct Capabilities {
     skills: Vec<SkillInfo>,
     mcp_servers: Vec<String>,
@@ -600,6 +611,7 @@ fn App() -> impl IntoView {
     let project_info = create_rw_signal::<Option<ProjectInfo>>(None);
     let show_capabilities = create_rw_signal(false);
     let caps = create_rw_signal::<Option<Capabilities>>(None);
+    let bootstrap = create_rw_signal::<Option<BootstrapStatus>>(None);
     let show_onboarding = create_rw_signal(false);
     let onboard_step = create_rw_signal(0usize);
 
@@ -611,6 +623,10 @@ fn App() -> impl IntoView {
         let v = invoke("get_onboarding_state", JsValue::UNDEFINED).await;
         if let Ok(s) = serde_wasm_bindgen::from_value::<OnboardingState>(v) {
             if s.show { show_onboarding.set(true); }
+        }
+        let b = invoke("get_bootstrap_status", JsValue::UNDEFINED).await;
+        if let Ok(st) = serde_wasm_bindgen::from_value::<BootstrapStatus>(b) {
+            bootstrap.set(Some(st));
         }
     });
 
@@ -691,12 +707,33 @@ fn App() -> impl IntoView {
         let arg = to_value(&serde_json::json!({ "message": text })).unwrap();
         let _ = args;
         spawn_local(async move {
-            let _ = invoke("send_message", arg).await;
+            if let Err(err) = invoke_checked("send_message", arg).await {
+                status.set(format!("Send failed: {}", js_error_text(err)));
+                busy.set(false);
+            }
         });
     };
 
     let on_send = move |_ev: web_sys::KeyboardEvent| {
         if _ev.key() == "Enter" && !_ev.shift_key() { _ev.prevent_default(); send(); }
+    };
+
+    let check_updates = move |_| {
+        if settings_busy.get() { return; }
+        settings_busy.set(true);
+        settings_message.set(Some((true, "Checking for updates...".into())));
+        let msg = settings_message;
+        let busy = settings_busy;
+        spawn_local(async move {
+            match invoke_checked("check_for_updates", JsValue::UNDEFINED).await {
+                Ok(v) => {
+                    let text = v.as_string().unwrap_or_else(|| "Update check complete.".into());
+                    msg.set(Some((true, text)));
+                }
+                Err(err) => msg.set(Some((false, js_error_text(err)))),
+            }
+            busy.set(false);
+        });
     };
 
     let open_settings = move |_| {
@@ -1201,6 +1238,7 @@ fn App() -> impl IntoView {
                             class:fail=move || !ok>{text}</div>
                     })}
                     <div class="row">
+                        <button type="button" disabled=move || settings_busy.get() on:click=check_updates>"Check for updates"</button>
                         <button type="button" disabled=move || settings_busy.get() on:click=validate_settings>"Valid"</button>
                         <button type="button" disabled=move || settings_busy.get() on:click=move |_| show_settings.set(false)>"Cancel"</button>
                         <button type="button" class="primary" disabled=move || settings_busy.get() on:click=save_settings>"Save"</button>
@@ -1276,6 +1314,23 @@ fn App() -> impl IntoView {
                         <h2>"Capabilities"</h2>
                         <button class="icon-btn" on:click=move |_| show_capabilities.set(false)>"×"</button>
                     </div>
+                    {move || bootstrap.get().map(|b| view! {
+                        <div class="cap-section">
+                            <h3>{format!("Runtime v{}", b.app_version)}</h3>
+                            <p class="hint">{format!("Workspace: {}", b.workspace)}</p>
+                            <p class="hint">{format!(
+                                "Python: {} · uv: {} · bundled MCP packages: {}",
+                                if b.python_ok { "ready" } else { "missing" },
+                                if b.uv_ok { "found" } else { "missing" },
+                                b.mcp_catalog
+                            )}</p>
+                            {(!b.errors.is_empty()).then(|| view! {
+                                <div class="settings-status fail">
+                                    {b.errors.join("\n")}
+                                </div>
+                            })}
+                        </div>
+                    })}
                     {move || caps.get().map(|c| view! {
                         <div class="cap-grid">
                             <div class="cap-stat"><span class="cap-num">{c.project.skill_count}</span><span class="cap-label">"Skills"</span></div>

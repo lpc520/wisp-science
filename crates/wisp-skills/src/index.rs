@@ -7,12 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// Path to the skills catalog bundled inside the Wisp source tree
-/// (`wisp/skills`), resolved from this crate's manifest dir. Returns `None`
-/// in a relocated install where the bundled catalog isn't next to the crate.
+/// Path to the skills catalog bundled with the app (`skills/`).
 pub fn bundled_dir() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("skills");
-    if p.is_dir() { Some(p) } else { None }
+    wisp_paths::skills_dir()
 }
 
 #[derive(Debug, Clone)]

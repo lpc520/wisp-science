@@ -16,9 +16,27 @@
     ],
     "security": { "csp": null }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUzMUEzNkQ4RDJDNTg3RjcKUldUM2g4WFMyRFlhNCtoVEpjeVlJbzVKTzF4SEovbE84QzVEbTU2U010WnIrdTdhdStpeE1PMHoK",
+      "endpoints": [
+        "https://github.com/xuzhougeng/wisp-science/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
+    "resources": [
+      "../skills/**/*",
+      "../python/**/*",
+      "../mcp-servers/bio-tools/**/*",
+      "../seed/**/*"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

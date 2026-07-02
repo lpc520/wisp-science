@@ -16,3 +16,4 @@ which = "7"
 uuid = { workspace = true }
 wisp-llm = { workspace = true }
 wisp-tools = { workspace = true }
+wisp-paths = { workspace = true }

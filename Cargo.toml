@@ -9,6 +9,7 @@ members = [
     "crates/wisp-python",
     "crates/wisp-mcp",
     "crates/wisp-cli",
+    "crates/wisp-paths",
     "src-tauri",
 ]
 default-members = ["crates/wisp-cli"]
@@ -48,6 +49,7 @@ wisp-store = { path = "crates/wisp-store" }
 wisp-skills = { path = "crates/wisp-skills" }
 wisp-python = { path = "crates/wisp-python" }
 wisp-mcp = { path = "crates/wisp-mcp" }
+wisp-paths = { path = "crates/wisp-paths" }
 
 [profile.release]
 codegen-units = 1

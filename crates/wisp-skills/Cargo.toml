@@ -14,3 +14,4 @@ tracing = { workspace = true }
 walkdir = { workspace = true }
 wisp-llm = { workspace = true }
 wisp-tools = { workspace = true }
+wisp-paths = { workspace = true }

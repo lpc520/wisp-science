@@ -154,7 +154,8 @@ async fn main() -> Result<()> {
 
     // Provision a uv venv once; shared by the Python REPL and the bundled
     // bio-tools MCP server. Skipped silently if uv isn't installed.
-    let py_env = wisp_python::PythonEnv::ensure(&root).ok();
+    let app_data = root.join(".wisp");
+    let py_env = wisp_python::PythonEnv::ensure(&app_data).ok();
 
     // Python REPL: needs a kernel_worker path. Default to the bundled worker.
     let worker = std::env::var("WISP_KERNEL_WORKER")
@@ -195,14 +196,11 @@ async fn main() -> Result<()> {
             let args: Vec<String> = parts[1..].to_vec();
             wire_mcp(&mut agent, &parts[0], &args).await;
         }
-    } else if let Ok(pkg) = std::env::var("WISP_MCP_PKG") {
-        if let Some(env) = &py_env {
-            match wisp_mcp::McpClient::launch_bio_tools(&env.python(), &pkg).await {
-                Ok(client) => register_mcp_tools(&mut agent, std::sync::Arc::new(client), &format!("bio-tools:{pkg}")).await,
-                Err(e) => println!("mcp bio-tools:{pkg} launch failed: {e}"),
-            }
-        } else {
-            println!("mcp bio-tools:{pkg} skipped: uv venv unavailable");
+    } else if let Some(env) = &py_env {
+        let pkg = std::env::var("WISP_MCP_PKG").unwrap_or_else(|_| "mcp_bio".into());
+        match wisp_mcp::McpClient::launch_bio_tools(&env.python(), &pkg).await {
+            Ok(client) => register_mcp_tools(&mut agent, std::sync::Arc::new(client), &format!("bio-tools:{pkg}")).await,
+            Err(e) => println!("mcp bio-tools:{pkg} launch failed: {e}"),
         }
     }
 

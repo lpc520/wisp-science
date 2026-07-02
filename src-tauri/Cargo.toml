@@ -31,4 +31,8 @@ wisp-skills = { workspace = true }
 wisp-store = { workspace = true }
 wisp-python = { workspace = true }
 wisp-mcp = { workspace = true }
+wisp-paths = { workspace = true }
 wisp-tools = { workspace = true }
+
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-updater = "2"

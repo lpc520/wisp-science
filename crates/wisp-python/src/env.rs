@@ -27,41 +27,65 @@ impl PythonEnv {
         }
     }
 
-    /// Ensure a venv exists at `<root>/.wisp/python/.venv`, creating it with
-    /// `uv venv` if missing. Returns the env handle.
-    pub fn ensure(root: &Path) -> Result<Self> {
-        let venv = root.join(".wisp").join("python").join(".venv");
-        if venv.join(if cfg!(target_os = "windows") { "Scripts\\python.exe" } else { "bin/python" }).exists() {
-            return Ok(Self { venv });
-        }
+    /// Ensure a venv exists under `app_data/python/.venv`, create with `uv venv`,
+    /// and install MCP/kernel deps from the bundled requirements file when needed.
+    pub fn ensure(app_data: &Path) -> Result<Self> {
+        let venv = app_data.join("python").join(".venv");
+        let python = if cfg!(target_os = "windows") {
+            venv.join("Scripts").join("python.exe")
+        } else {
+            venv.join("bin").join("python")
+        };
         let uv = Self::find_uv().ok_or_else(|| anyhow!("uv not found on PATH; install uv or set UV_PATH"))?;
-        std::fs::create_dir_all(venv.parent().unwrap_or(Path::new(".")))?;
-        let out = Command::new(&uv).arg("venv").arg(&venv).output()?;
-        if !out.status.success() {
-            return Err(anyhow!("uv venv failed: {}", String::from_utf8_lossy(&out.stderr)));
+        if !python.exists() {
+            std::fs::create_dir_all(venv.parent().unwrap_or(Path::new(".")))?;
+            let out = Command::new(&uv).arg("venv").arg(&venv).output()?;
+            if !out.status.success() {
+                return Err(anyhow!("uv venv failed: {}", String::from_utf8_lossy(&out.stderr)));
+            }
         }
+        Self::install_deps(&uv, &python, &venv)?;
         Ok(Self { venv })
+    }
+
+    fn install_deps(uv: &Path, python: &Path, venv: &Path) -> Result<()> {
+        let Some(req) = wisp_paths::mcp_requirements_path() else {
+            return Ok(());
+        };
+        let marker = venv.join(".wisp_deps_ok");
+        if marker.is_file() {
+            return Ok(());
+        }
+        let out = Command::new(uv)
+            .args(["pip", "install", "-r"])
+            .arg(&req)
+            .arg("--python")
+            .arg(python)
+            .output()?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "uv pip install failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        std::fs::write(&marker, b"ok")?;
+        Ok(())
     }
 }
 
-fn bundled_python_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("python")
-}
-
-/// Path to the kernel worker bundled in the repo (`python/kernel_worker.py`).
+/// Path to the kernel worker bundled with the app (`python/kernel_worker.py`).
 pub fn bundled_worker_path() -> Option<PathBuf> {
-    let p = bundled_python_dir().join("kernel_worker.py");
-    if p.is_file() { Some(p) } else { None }
+    wisp_paths::kernel_worker_path()
 }
 
-/// Path to the mock MCP server bundled in the repo (`python/mock_mcp_server.py`).
+/// Path to the mock MCP server bundled with the app.
 pub fn bundled_mock_mcp_path() -> Option<PathBuf> {
-    let p = bundled_python_dir().join("mock_mcp_server.py");
-    if p.is_file() { Some(p) } else { None }
+    wisp_paths::python_dir()
+        .map(|d| d.join("mock_mcp_server.py"))
+        .filter(|p| p.is_file())
 }
 
-/// Resolve a script path, remapping stale `wisp/python/*.py` locations to the
-/// bundled `python/` tree when the given path no longer exists.
+/// Resolve a script path, remapping stale locations to bundled `python/` when missing.
 pub fn resolve_bundled_script(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.is_file() {

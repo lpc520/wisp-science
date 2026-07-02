@@ -16,11 +16,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
-/// Path to the vendored bio-tools MCP servers bundled inside the Wisp source
-/// tree (`wisp/mcp-servers/bio-tools`), resolved from this crate's manifest.
+/// Path to the vendored bio-tools MCP servers bundled with the app.
 pub fn bundled_bio_tools_dir() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("mcp-servers").join("bio-tools");
-    if p.is_dir() { Some(p) } else { None }
+    wisp_paths::bio_tools_dir()
 }
 
 #[derive(Debug, Clone)]

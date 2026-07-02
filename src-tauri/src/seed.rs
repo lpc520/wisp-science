@@ -10,10 +10,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// `wisp/seed`, resolved from this crate's manifest dir.
+/// Bundled demo manifests (`seed/`).
 pub fn bundled_dir() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("seed");
-    if p.is_dir() { Some(p) } else { None }
+    wisp_paths::seed_dir()
 }
 
 #[derive(Serialize, Clone)]

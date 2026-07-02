@@ -155,6 +155,17 @@ struct Settings {
     has_api_key: bool,
 }
 
+#[derive(Serialize, Clone)]
+struct BootstrapStatus {
+    skills_loaded: usize,
+    python_ok: bool,
+    mcp_catalog: usize,
+    uv_ok: bool,
+    app_version: String,
+    workspace: String,
+    errors: Vec<String>,
+}
+
 struct SessionState {
     frame_id: Option<String>,
     last_seq: i64,
@@ -162,6 +173,7 @@ struct SessionState {
 
 struct AppState {
     root: PathBuf,
+    app_data: PathBuf,
     store: Store,
     project_id: String,
     skills: Arc<SkillIndex>,
@@ -169,6 +181,7 @@ struct AppState {
     agent: tokio::sync::Mutex<Option<Agent>>,
     session: tokio::sync::Mutex<SessionState>,
     confirm: Arc<StdMutex<Option<std::sync::mpsc::Sender<bool>>>>,
+    bootstrap: StdMutex<BootstrapStatus>,
 }
 
 /// `wisp_core::Output` backed by Tauri events. `confirm` blocks on a std
@@ -305,10 +318,16 @@ fn skill_paths(root: &std::path::Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Wire the Python REPL (bundled kernel worker) and an MCP server into a
-/// freshly built agent. Mirrors the CLI wiring; best-effort, never fatal.
-async fn wire_python_and_mcp(agent: &mut wisp_core::Agent, root: &std::path::Path) {
-    let py_env = wisp_python::PythonEnv::ensure(root).ok();
+/// Wire Python REPL and bundled bio-tools MCP into a freshly built agent.
+async fn wire_python_and_mcp(agent: &mut wisp_core::Agent, app_data: &std::path::Path) -> Vec<String> {
+    let mut errors = vec![];
+    let py_env = match wisp_python::PythonEnv::ensure(app_data) {
+        Ok(env) => Some(env),
+        Err(e) => {
+            errors.push(format!("Python environment: {e}"));
+            None
+        }
+    };
 
     let worker = std::env::var("WISP_KERNEL_WORKER")
         .ok()
@@ -317,10 +336,13 @@ async fn wire_python_and_mcp(agent: &mut wisp_core::Agent, root: &std::path::Pat
     let worker_path = wisp_python::resolve_bundled_script(&worker);
     if worker_path.is_file() {
         if let Some(env) = &py_env {
-            if let Ok(client) = wisp_python::KernelClient::spawn(&env.python(), &worker_path) {
-                agent.add_tool(Box::new(wisp_python::ReplTool::new(client)));
+            match wisp_python::KernelClient::spawn(&env.python(), &worker_path) {
+                Ok(client) => agent.add_tool(Box::new(wisp_python::ReplTool::new(client))),
+                Err(e) => errors.push(format!("Python REPL: {e}")),
             }
         }
+    } else {
+        errors.push(format!("Kernel worker not found at {}", worker_path.display()));
     }
 
     if let Ok(cmdline) = std::env::var("WISP_MCP_COMMAND") {
@@ -336,24 +358,29 @@ async fn wire_python_and_mcp(agent: &mut wisp_core::Agent, root: &std::path::Pat
             .collect();
         if parts.len() >= 2 {
             let args: Vec<String> = parts[1..].to_vec();
-            if let Ok(client) = wisp_mcp::McpClient::launch(&parts[0], &args).await {
-                register_mcp(agent, std::sync::Arc::new(client)).await;
+            match wisp_mcp::McpClient::launch(&parts[0], &args).await {
+                Ok(client) => register_mcp(agent, std::sync::Arc::new(client)).await,
+                Err(e) => errors.push(format!("MCP command: {e}")),
             }
         }
-    } else if let Ok(pkg) = std::env::var("WISP_MCP_PKG") {
-        if let Some(env) = &py_env {
-            if let Ok(client) = wisp_mcp::McpClient::launch_bio_tools(&env.python(), &pkg).await {
-                register_mcp(agent, std::sync::Arc::new(client)).await;
-            }
+    } else if let Some(env) = &py_env {
+        let pkg = std::env::var("WISP_MCP_PKG").unwrap_or_else(|_| "mcp_bio".into());
+        match wisp_mcp::McpClient::launch_bio_tools(&env.python(), &pkg).await {
+            Ok(client) => register_mcp(agent, std::sync::Arc::new(client)).await,
+            Err(e) => errors.push(format!("MCP {pkg}: {e}")),
         }
     }
+    errors
 }
 
 async fn register_mcp(agent: &mut wisp_core::Agent, client: std::sync::Arc<wisp_mcp::McpClient>) {
-    if let Ok(tools) = client.tools_list().await {
-        for t in tools {
-            agent.add_tool(Box::new(wisp_mcp::McpTool::new(t, client.clone())));
+    match client.tools_list().await {
+        Ok(tools) => {
+            for t in tools {
+                agent.add_tool(Box::new(wisp_mcp::McpTool::new(t, client.clone())));
+            }
         }
+        Err(e) => tracing::warn!("mcp tools_list failed: {e}"),
     }
 }
 
@@ -399,7 +426,10 @@ async fn send_message(state: State<'_, AppState>, app: AppHandle, message: Strin
         if agent.ctx.is_empty() {
             agent.seed_system_prompt(&state.skills);
         }
-        wire_python_and_mcp(&mut agent, &state.root).await;
+        let wire_errors = wire_python_and_mcp(&mut agent, &state.app_data).await;
+        if !wire_errors.is_empty() {
+            state.bootstrap.lock().unwrap().errors.extend(wire_errors);
+        }
         *guard = Some(agent);
     }
     let agent = guard.as_mut().unwrap();
@@ -666,14 +696,8 @@ async fn read_artifact(state: State<'_, AppState>, id: String) -> Result<FileCon
     read_file_at(&state, storage_path, None)
 }
 
-fn mcp_lib_dir(root: &std::path::Path) -> Option<PathBuf> {
-    for lib in [
-        root.join("mcp-servers").join("bio-tools").join("lib"),
-        root.join("..").join("mcp-servers").join("bio-tools").join("lib"),
-    ] {
-        if lib.is_dir() { return Some(lib); }
-    }
-    None
+fn mcp_lib_dir(_root: &std::path::Path) -> Option<PathBuf> {
+    wisp_paths::bio_tools_dir().map(|d| d.join("lib"))
 }
 
 fn list_mcp_servers(root: &std::path::Path) -> Vec<String> {
@@ -758,6 +782,51 @@ async fn get_onboarding_state(state: State<'_, AppState>) -> Result<OnboardingSt
     Ok(OnboardingState { show: !done, has_api_key: !api_key.is_empty() })
 }
 
+fn initial_bootstrap(app_data: &std::path::Path, workspace: &std::path::Path, skills: usize) -> BootstrapStatus {
+    let mut status = BootstrapStatus {
+        skills_loaded: skills,
+        python_ok: false,
+        mcp_catalog: list_mcp_servers(workspace).len(),
+        uv_ok: wisp_python::PythonEnv::find_uv().is_some(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        workspace: workspace.to_string_lossy().into_owned(),
+        errors: vec![],
+    };
+    if status.skills_loaded == 0 {
+        status.errors.push("No bundled skills found in install resources.".into());
+    }
+    if !status.uv_ok {
+        status.errors.push("uv not found on PATH; install uv or set UV_PATH.".into());
+    }
+    match wisp_python::PythonEnv::ensure(app_data) {
+        Ok(_) => status.python_ok = true,
+        Err(e) => status.errors.push(format!("Python environment: {e}")),
+    }
+    if wisp_paths::bio_tools_dir().is_none() {
+        status.errors.push("Bundled bio-tools MCP catalog not found.".into());
+    }
+    status
+}
+
+#[tauri::command]
+fn get_bootstrap_status(state: State<'_, AppState>) -> BootstrapStatus {
+    state.bootstrap.lock().unwrap().clone()
+}
+
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> Result<String, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| format!("{e}"))?;
+    match updater.check().await {
+        Ok(Some(update)) => {
+            update.download_and_install(|_, _| {}, || {}).await.map_err(|e| format!("{e}"))?;
+            Ok(format!("Updated to v{}. Restart the app.", update.version))
+        }
+        Ok(None) => Ok("You are on the latest version.".into()),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
 #[tauri::command]
 async fn dismiss_onboarding(state: State<'_, AppState>) -> Result<(), String> {
     state.store.set_setting("onboarding_done", "1").await.map_err(|e| format!("{e}"))
@@ -788,15 +857,33 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let db_path = root.join(".wisp").join("wisp.sqlite");
+            if let Ok(res) = app.path().resource_dir() {
+                wisp_paths::set_resource_root(res);
+            }
+            let app_data = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from(".wisp"))
+                .join("wisp-science");
+            std::fs::create_dir_all(&app_data).expect("create app data dir");
+            let workspace = app
+                .path()
+                .document_dir()
+                .map(|d| d.join("wisp-science"))
+                .unwrap_or_else(|_| app_data.join("workspace"));
+            std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+            let db_path = app_data.join("wisp.sqlite");
             let store = tauri::async_runtime::block_on(Store::open(&db_path)).expect("open store");
             let _ = tauri::async_runtime::block_on(store.create_project("default", "Workspace"));
-            let skills = Arc::new(SkillIndex::load(&skill_paths(&root)));
-            let memory = Arc::new(MemoryManager::new(&root));
+            let skills = Arc::new(SkillIndex::load(&skill_paths(&workspace)));
+            let memory = Arc::new(MemoryManager::new(&workspace));
+            let bootstrap = StdMutex::new(initial_bootstrap(&app_data, &workspace, skills.all().len()));
             let state = AppState {
-                root,
+                root: workspace,
+                app_data,
                 store,
                 project_id: "default".into(),
                 skills,
@@ -804,6 +891,7 @@ pub fn run() {
                 agent: tokio::sync::Mutex::new(None),
                 session: tokio::sync::Mutex::new(SessionState { frame_id: None, last_seq: 0 }),
                 confirm: Arc::new(StdMutex::new(None)),
+                bootstrap,
             };
             app.manage(state);
             Ok(())
@@ -831,6 +919,8 @@ pub fn run() {
             list_memory,
             get_onboarding_state,
             dismiss_onboarding,
+            get_bootstrap_status,
+            check_for_updates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wisp");
