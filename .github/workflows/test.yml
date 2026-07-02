@@ -23,6 +23,13 @@ jobs:
             ui -> target
           cache-on-failure: true
 
+      # src-tauri (workspace member) pulls in webkit2gtk/gtk3 on Linux; these
+      # aren't preinstalled on ubuntu-latest. See tauri.app/start/prerequisites.
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+
       - name: cargo test --workspace
         run: cargo test --workspace
 
