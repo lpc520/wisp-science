@@ -15,3 +15,7 @@ ui-tests/test-results/
 wisp-cli*.exe
 wisp-science*.exe
 /runtime
+# local session / recordings (never commit)
+.claude/
+cladue_science.mp4
+*.mp4

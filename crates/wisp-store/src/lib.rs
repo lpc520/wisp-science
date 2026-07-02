@@ -26,6 +26,9 @@ impl Store {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true);
         let pool = SqlitePoolOptions::new().max_connections(4).connect_with(opts).await?;
+        // WAL journaling so a crash mid-turn can't corrupt the DB and committed
+        // messages survive (pairs with incremental message persistence).
+        sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
         Self::migrate(&pool).await?;
         Ok(Self { pool })
     }

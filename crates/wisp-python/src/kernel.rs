@@ -84,6 +84,14 @@ impl KernelClient {
         self.stdin.flush().await?;
 
         loop {
+            // Cancel at line boundaries only: read_line is not cancellation-safe,
+            // so we never wrap it in a timeout/select. We don't kill the worker
+            // (its namespace is persistent) — we stop waiting; its late response
+            // is skipped next cell by id mismatch. ponytail: a compute-bound cell
+            // that emits no lines stays uninterruptible, same ceiling as shell.
+            if env.is_cancelled() {
+                return Err(anyhow!("interrupted by user"));
+            }
             let mut line = String::new();
             let n = self.stdout.read_line(&mut line).await?;
             if n == 0 {

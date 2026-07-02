@@ -22,8 +22,12 @@ pub async fn agent_loop(
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     ctx.append_user(user_input);
+    if let Some(m) = ctx.messages.last() { output.on_message(m); }
 
-    let env = ToolEnvAdapter::new(root.to_path_buf(), output);
+    let env = match cancel {
+        Some(c) => ToolEnvAdapter::with_cancel(root.to_path_buf(), output, c),
+        None => ToolEnvAdapter::new(root.to_path_buf(), output),
+    };
     let mut iteration = 0usize;
     loop {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -35,6 +39,7 @@ pub async fn agent_loop(
         let comp = provider.stream(&messages, &tools.schemas(), &mut sink).await?;
 
         ctx.append_assistant(comp.content.clone(), comp.tool_calls.clone(), comp.reasoning.clone());
+        if let Some(m) = ctx.messages.last() { output.on_message(m); }
         output.usage(
             iteration,
             comp.usage.input_tokens,
@@ -59,6 +64,7 @@ pub async fn agent_loop(
             };
             output.tool_result(&name, result.success, &result.content);
             ctx.append_tool(&tc.id, &name, content);
+            if let Some(m) = ctx.messages.last() { output.on_message(m); }
             if name == "attempt_completion" {
                 completed = true;
                 break;

@@ -16,6 +16,14 @@ use wisp_llm::ToolSchema;
 const TIMEOUT_SECS: u64 = 60;
 const MAX_LINES: usize = 1000;
 
+/// Resolves once the env's cancel flag is set. Polls at 100ms — cheap, and
+/// bounds Stop-button latency to ~100ms while a command is mid-run.
+async fn cancel_watch(env: &dyn ToolEnv) {
+    while !env.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 pub struct ShellTool;
 
 #[async_trait]
@@ -74,6 +82,12 @@ impl Tool for ShellTool {
         if let Some(stdout) = stdout {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
+                // Stop mid-stream when the user hits Stop (this is where a
+                // recursive scan like `Get-ChildItem -Recurse` spends its time).
+                if env.is_cancelled() {
+                    let _ = child.kill().await;
+                    return ToolResult::fail("interrupted by user");
+                }
                 env.emit(ToolEvent::Stdout { chunk: format!("{line}\n") }).await;
                 out_lines.push(line);
                 if out_lines.len() > MAX_LINES + 50 { break; }
@@ -82,18 +96,30 @@ impl Tool for ShellTool {
         if let Some(stderr) = stderr {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
+                if env.is_cancelled() {
+                    let _ = child.kill().await;
+                    return ToolResult::fail("interrupted by user");
+                }
                 out_lines.push(line);
                 if out_lines.len() > MAX_LINES + 50 { break; }
             }
         }
 
-        let wait = tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), child.wait()).await;
-        let status = match wait {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return ToolResult::fail(format!("shell error: {e}")),
-            Err(_) => {
+        // ponytail: race child exit against the timeout and the cancel flag;
+        // kill on either. cancel_watch polls at 100ms — a silent hang with no
+        // output is still bounded by TIMEOUT_SECS.
+        let status = tokio::select! {
+            res = child.wait() => match res {
+                Ok(s) => s,
+                Err(e) => return ToolResult::fail(format!("shell error: {e}")),
+            },
+            _ = tokio::time::sleep(Duration::from_secs(TIMEOUT_SECS)) => {
                 let _ = child.kill().await;
                 return ToolResult::fail(format!("exec {cmd} timed out after {TIMEOUT_SECS}s"));
+            }
+            _ = cancel_watch(env) => {
+                let _ = child.kill().await;
+                return ToolResult::fail("interrupted by user");
             }
         };
 

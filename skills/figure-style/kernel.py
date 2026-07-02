@@ -1,5 +1,55 @@
 META_GREY = "#888888"
 
+# Known CJK-capable fonts shipped with each OS, tried by path first (so we can
+# register the exact file with matplotlib) then by family name. Fixes Chinese/
+# Japanese/Korean labels rendering as tofu boxes (□□□) when matplotlib falls
+# back to DejaVu Sans, which has no CJK glyphs.
+_CJK_CANDIDATES = {
+    "Windows": [
+        ("Microsoft YaHei", r"C:\Windows\Fonts\msyh.ttc"),
+        ("Microsoft YaHei", r"C:\Windows\Fonts\msyh.ttf"),
+        ("SimHei", r"C:\Windows\Fonts\simhei.ttf"),
+        ("SimSun", r"C:\Windows\Fonts\simsun.ttc"),
+    ],
+    "Darwin": [
+        ("PingFang SC", "/System/Library/Fonts/PingFang.ttc"),
+        ("Hiragino Sans GB", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        ("STHeiti", "/System/Library/Fonts/STHeiti Medium.ttc"),
+    ],
+    "Linux": [
+        ("Noto Sans CJK SC", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ("Noto Sans CJK SC", "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+        ("WenQuanYi Zen Hei", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+        ("Source Han Sans SC", "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf"),
+    ],
+}
+
+
+def _find_cjk_font():
+    """Return a CJK-capable family name registered with matplotlib, or None.
+
+    Tries the current OS's known font files first (registering the file so the
+    family becomes usable), then falls back to any CJK family already known to
+    the font manager. No bundled font needed — uses what's on the machine.
+    """
+    import os
+    import platform
+    import matplotlib.font_manager as fm
+    for family, path in _CJK_CANDIDATES.get(platform.system(), []):
+        if os.path.isfile(path):
+            try:
+                fm.fontManager.addfont(path)
+                return family
+            except Exception:
+                continue
+    known = {f.name for f in fm.fontManager.ttflist}
+    for family in ("Microsoft YaHei", "SimHei", "PingFang SC", "Hiragino Sans GB",
+                   "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Zen Hei",
+                   "Arial Unicode MS"):
+        if family in known:
+            return family
+    return None
+
 
 def apply_figure_style(*, frame="open", font=None, sizes=(8, 7, 6), grid=False):
     """Set matplotlib rcParams for publication-grade output. Call once before plotting.
@@ -55,8 +105,19 @@ def apply_figure_style(*, frame="open", font=None, sizes=(8, 7, 6), grid=False):
         "patch.linewidth": 0.6,
         "pdf.fonttype": 42, "ps.fonttype": 42,
     }
+    # Build the sans-serif fallback chain. Always include a CJK font (if the OS
+    # has one) so Chinese/JP/KR labels render instead of tofu boxes; keep DejaVu
+    # for Latin. CJK goes first when no explicit `font` is given so it wins even
+    # on older matplotlib without per-glyph fallback.
+    sans = []
     if font:
-        rc["font.sans-serif"] = [font, "DejaVu Sans"]
+        sans.append(font)
+    cjk = _find_cjk_font()
+    if cjk and cjk not in sans:
+        sans.append(cjk)
+    sans.extend(["DejaVu Sans", "Liberation Sans", "Arial"])
+    rc["font.sans-serif"] = sans
+    rc["axes.unicode_minus"] = False  # keep the minus sign from becoming a box too
     mpl.rcParams.update(rc)
 
 
@@ -288,3 +349,17 @@ def panel_crops(fig, dpi=None, pad_px=6, bbox_inches=None, pad_inches=None):
             min(int(by1) + pad_px, H_px),
         )
     return out
+
+
+if __name__ == "__main__":
+    # ponytail: smoke-check the CJK font wiring — the sans-serif chain must be
+    # populated (so CJK glyphs have somewhere to resolve) and the minus sign
+    # must not be a unicode box. Run: `python kernel.py`.
+    import matplotlib
+    matplotlib.use("Agg")
+    apply_figure_style()
+    sans = matplotlib.rcParams["font.sans-serif"]
+    assert sans, "font.sans-serif must not be empty"
+    assert "DejaVu Sans" in sans, "DejaVu Sans should remain a Latin fallback"
+    assert matplotlib.rcParams["axes.unicode_minus"] is False
+    print("figure-style self-check OK; font.sans-serif =", sans)
