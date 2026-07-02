@@ -140,7 +140,14 @@ fn messages_to_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
                 }
             }
             wisp_llm::Role::Tool => {
-                out.push(UiItem { role: "tool".into(), text: m.content.as_text(), tool_name: m.tool_name.clone(), ok: Some(true) });
+                let text = m.content.as_text();
+                if m.tool_name.as_deref() == Some("attempt_completion") {
+                    if !text.trim().is_empty() {
+                        out.push(UiItem { role: "assistant".into(), text, tool_name: None, ok: None });
+                    }
+                } else {
+                    out.push(UiItem { role: "tool".into(), text, tool_name: m.tool_name.clone(), ok: Some(true) });
+                }
             }
             wisp_llm::Role::System => {}
         }

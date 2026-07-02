@@ -713,89 +713,120 @@ fn push_file_artifact(out: &mut Vec<Artifact>, seen: &mut std::collections::Hash
     out.push(Artifact { id, name, kind, data: PreviewData::File { path: p.to_string(), kind: kind.to_string() } });
 }
 
+struct ArtifactScan {
+    tbl_n: usize,
+    csv_n: usize,
+    code_n: usize,
+    tex_n: usize,
+}
+
+fn collect_markdown_artifacts(
+    out: &mut Vec<Artifact>,
+    seen: &mut std::collections::HashSet<String>,
+    s: &str,
+    locale: Locale,
+    scan: &mut ArtifactScan,
+) {
+    for seg in split_segments(s) {
+        if let Seg::Table(t) = seg {
+            scan.tbl_n += 1;
+            let id = next_artifact_id(out.len());
+            out.push(Artifact {
+                id,
+                name: tf(locale, "artifact.table", &[("n", &scan.tbl_n.to_string())]),
+                kind: "table",
+                data: PreviewData::Table(t),
+            });
+        }
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let f = lines[i].trim().to_ascii_lowercase();
+        if f.starts_with("```") {
+            let lang = f.trim_start_matches('`').split_whitespace().next().unwrap_or("").to_string();
+            let mut body = vec![];
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim().starts_with("```") { body.push(lines[j]); j += 1; }
+            if !body.is_empty() {
+                if lang == "csv" || lang == "tsv" {
+                    let headers = parse_csv_line(body[0]);
+                    let rows: Vec<Vec<String>> = body[1..].iter().map(|l| parse_csv_line(l)).collect();
+                    scan.csv_n += 1;
+                    let id = next_artifact_id(out.len());
+                    out.push(Artifact { id, name: format!("data-{}.csv", scan.csv_n), kind: "csv", data: PreviewData::Table(TableData { headers, rows }) });
+                } else if lang == "fasta" || lang == "fa" {
+                    let id = next_artifact_id(out.len());
+                    out.push(Artifact { id, name: format!("alignment-{}.fasta", scan.csv_n), kind: "fasta", data: PreviewData::Fasta(body.join("\n")) });
+                } else {
+                    scan.code_n += 1;
+                    let id = next_artifact_id(out.len());
+                    out.push(Artifact {
+                        id,
+                        name: tf(locale, "artifact.code", &[("n", &scan.code_n.to_string())]),
+                        kind: "code",
+                        data: PreviewData::Code { lang, body: body.join("\n") },
+                    });
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if lines[i].trim().starts_with("$") {
+            let mut body = vec![];
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim().ends_with("$") { body.push(lines[j]); j += 1; }
+            if j < lines.len() { body.push(lines[j].trim().trim_end_matches("$")); }
+            scan.tex_n += 1;
+            let id = next_artifact_id(out.len());
+            out.push(Artifact {
+                id,
+                name: tf(locale, "artifact.equation", &[("n", &scan.tex_n.to_string())]),
+                kind: "latex",
+                data: PreviewData::Latex { tex: body.join("\n"), display: true },
+            });
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    for word in s.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '[' || c == ']') {
+        push_file_artifact(out, seen, word);
+    }
+}
+
+/// Promote `attempt_completion` output into the assistant bubble (web-dist renders
+/// completion as the final markdown response, not a collapsed tool row).
+fn promote_assistant_text(items: &mut Vec<ChatItem>, text: &str) {
+    if text.trim().is_empty() { return; }
+    if let Some(i) = items.iter().rposition(|i| matches!(i, ChatItem::Assistant(_))) {
+        if let ChatItem::Assistant(s) = &mut items[i] {
+            if s.is_empty() {
+                s.push_str(text);
+                return;
+            }
+        }
+    }
+    items.push(ChatItem::Assistant(text.to_string()));
+}
+
 /// Collect tables, code, latex, and file-path artifacts from the transcript.
 fn collect_artifacts(items: &[ChatItem], locale: Locale) -> Vec<Artifact> {
     let mut out: Vec<Artifact> = vec![];
     let mut seen = std::collections::HashSet::<String>::new();
-    let mut tbl_n = 0;
-    let mut csv_n = 0;
-    let mut code_n = 0;
-    let mut tex_n = 0;
+    let mut scan = ArtifactScan { tbl_n: 0, csv_n: 0, code_n: 0, tex_n: 0 };
 
     for it in items {
         match it {
-            ChatItem::Assistant(s) => {
-                for seg in split_segments(s) {
-                    if let Seg::Table(t) = seg {
-                        tbl_n += 1;
-                        let id = next_artifact_id(out.len());
-                        out.push(Artifact {
-                            id,
-                            name: tf(locale, "artifact.table", &[("n", &tbl_n.to_string())]),
-                            kind: "table",
-                            data: PreviewData::Table(t),
-                        });
+            ChatItem::Assistant(s) => collect_markdown_artifacts(&mut out, &mut seen, s, locale, &mut scan),
+            ChatItem::Tool { name, input, output, .. } => {
+                if name == "attempt_completion" && !output.is_empty() {
+                    collect_markdown_artifacts(&mut out, &mut seen, output, locale, &mut scan);
+                } else {
+                    let text = if output.is_empty() { input.as_str() } else { output.as_str() };
+                    for word in text.split(|c: char| c.is_whitespace() || c == '\n' || c == '"' || c == '\'') {
+                        push_file_artifact(&mut out, &mut seen, word);
                     }
-                }
-                let lines: Vec<&str> = s.lines().collect();
-                let mut i = 0;
-                while i < lines.len() {
-                    let f = lines[i].trim().to_ascii_lowercase();
-                    if f.starts_with("```") {
-                        let lang = f.trim_start_matches('`').split_whitespace().next().unwrap_or("").to_string();
-                        let mut body = vec![];
-                        let mut j = i + 1;
-                        while j < lines.len() && !lines[j].trim().starts_with("```") { body.push(lines[j]); j += 1; }
-                        if !body.is_empty() {
-                            if lang == "csv" || lang == "tsv" {
-                                let headers = parse_csv_line(body[0]);
-                                let rows: Vec<Vec<String>> = body[1..].iter().map(|l| parse_csv_line(l)).collect();
-                                csv_n += 1;
-                                let id = next_artifact_id(out.len());
-                                out.push(Artifact { id, name: format!("data-{csv_n}.csv"), kind: "csv", data: PreviewData::Table(TableData { headers, rows }) });
-                            } else if lang == "fasta" || lang == "fa" {
-                                let id = next_artifact_id(out.len());
-                                out.push(Artifact { id, name: format!("alignment-{csv_n}.fasta"), kind: "fasta", data: PreviewData::Fasta(body.join("\n")) });
-                            } else {
-                                code_n += 1;
-                                let id = next_artifact_id(out.len());
-                                out.push(Artifact {
-                                    id,
-                                    name: tf(locale, "artifact.code", &[("n", &code_n.to_string())]),
-                                    kind: "code",
-                                    data: PreviewData::Code { lang, body: body.join("\n") },
-                                });
-                            }
-                        }
-                        i = j + 1;
-                        continue;
-                    }
-                    if lines[i].trim().starts_with("$") {
-                        let mut body = vec![];
-                        let mut j = i + 1;
-                        while j < lines.len() && !lines[j].trim().ends_with("$") { body.push(lines[j]); j += 1; }
-                        if j < lines.len() { body.push(lines[j].trim().trim_end_matches("$")); }
-                        tex_n += 1;
-                        let id = next_artifact_id(out.len());
-                        out.push(Artifact {
-                            id,
-                            name: tf(locale, "artifact.equation", &[("n", &tex_n.to_string())]),
-                            kind: "latex",
-                            data: PreviewData::Latex { tex: body.join("\n"), display: true },
-                        });
-                        i = j + 1;
-                        continue;
-                    }
-                    i += 1;
-                }
-                for word in s.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '[' || c == ']') {
-                    push_file_artifact(&mut out, &mut seen, word);
-                }
-            }
-            ChatItem::Tool { input, output, .. } => {
-                let text = if output.is_empty() { input.as_str() } else { output.as_str() };
-                for word in text.split(|c: char| c.is_whitespace() || c == '\n' || c == '"' || c == '\'') {
-                    push_file_artifact(&mut out, &mut seen, word);
                 }
             }
             _ => {}
@@ -1217,10 +1248,13 @@ fn App() -> impl IntoView {
                 if let Some(i) = idx {
                     if let ChatItem::Tool { ok: o, output, .. } = &mut v[i] {
                         *o = Some(ok);
-                        *output = content;
+                        *output = content.clone();
                     }
                 } else {
-                    v.push(ChatItem::Tool { name, ok: Some(ok), input: String::new(), output: content });
+                    v.push(ChatItem::Tool { name: name.clone(), ok: Some(ok), input: String::new(), output: content.clone() });
+                }
+                if name == "attempt_completion" && ok {
+                    promote_assistant_text(v, &content);
                 }
             }),
             AgentEvent::Usage { input, output, ctx_tokens, max_context, .. } => {
@@ -2198,9 +2232,11 @@ fn render_item(
     let locale = use_locale();
     match item {
         ChatItem::User(s) => view! { <div class="role">{move || t(locale.get(), "chat.you")}</div><div class="body">{s.clone()}</div> }.into_view(),
+        ChatItem::Assistant(s) if s.trim().is_empty() => view! {}.into_view(),
         ChatItem::Assistant(s) => view! {
             <AssistantMessage text=s.clone() artifacts=artifacts.to_vec() on_artifact=on_artifact on_file=on_file />
         }.into_view(),
+        ChatItem::Tool { name, .. } if name == "attempt_completion" => view! {}.into_view(),
         ChatItem::Reasoning(s) => view! {
             <details class="rz">
                 <summary>{move || t(locale.get(), "chat.thinking")}</summary>
