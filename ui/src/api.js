@@ -46,6 +46,52 @@ export async function invoke_timeout(cmd, args, timeoutMs) {
   }
 }
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      if (typeof dataUrl !== "string") {
+        reject(new Error("Failed to read file"));
+        return;
+      }
+      const comma = dataUrl.indexOf(",");
+      resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
+    };
+    reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** @param {FileList|File[]} files */
+export async function upload_files(files) {
+  const list = Array.from(files || []);
+  const results = [];
+  for (const file of list) {
+    try {
+      const data_base64 = await fileToBase64(file);
+      const info = await invoke_strict("upload_file", { filename: file.name, data_base64 });
+      results.push({ ok: true, info });
+    } catch (err) {
+      results.push({
+        ok: false,
+        filename: file.name,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return results;
+}
+
+/** @param {string} inputId */
+export async function upload_input_files(inputId) {
+  const input = document.getElementById(inputId);
+  if (!input?.files?.length) return [];
+  const results = await upload_files(input.files);
+  input.value = "";
+  return results;
+}
+
 export async function listen(event, cb) {
   const bus = tauriEvent();
   if (!bus) {

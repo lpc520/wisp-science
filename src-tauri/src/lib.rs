@@ -861,9 +861,42 @@ async fn dismiss_onboarding(state: State<'_, AppState>) -> Result<(), String> {
     state.store.set_setting("onboarding_done", "1").await.map_err(|e| format!("{e}"))
 }
 
-#[tauri::command]
-async fn register_artifact(
-    state: State<'_, AppState>,
+fn sanitize_upload_name(name: &str) -> Result<String, String> {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "invalid filename".to_string())?;
+    if base.is_empty() || base == "." || base == ".." || base.contains('\0') {
+        return Err("invalid filename".into());
+    }
+    Ok(base.to_string())
+}
+
+fn unique_upload_path(root: &std::path::Path, dir: &str, name: &str) -> std::path::PathBuf {
+    let mut path = root.join(dir).join(name);
+    if !path.exists() {
+        return path;
+    }
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = std::path::Path::new(name).extension().and_then(|s| s.to_str());
+    for i in 1..1000 {
+        let candidate = match ext {
+            Some(e) => format!("{stem}_{i}.{e}"),
+            None => format!("{stem}_{i}"),
+        };
+        path = root.join(dir).join(&candidate);
+        if !path.exists() {
+            return path;
+        }
+    }
+    root.join(dir).join(name)
+}
+
+async fn register_artifact_at(
+    state: &AppState,
     path: String,
     content_type: Option<String>,
 ) -> Result<ArtifactInfo, String> {
@@ -877,6 +910,41 @@ async fn register_artifact(
     state.store.save_artifact(&id, &state.project_id, &frame_id, &filename, &mime, &storage).await.map_err(|e| format!("{e}"))?;
     let ts = chrono::Utc::now().timestamp();
     Ok(ArtifactInfo { id, name: filename, kind: mime, path: storage, ts })
+}
+
+#[tauri::command]
+async fn upload_file(
+    state: State<'_, AppState>,
+    filename: String,
+    data_base64: String,
+) -> Result<ArtifactInfo, String> {
+    use base64::Engine;
+    let name = sanitize_upload_name(&filename)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.trim())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    let cap = 32 * 1024 * 1024;
+    if bytes.len() > cap {
+        return Err(format!("file exceeds {cap} byte limit"));
+    }
+    let upload_dir = state.root.join("uploads");
+    std::fs::create_dir_all(&upload_dir).map_err(|e| format!("{e}"))?;
+    let dest = unique_upload_path(&state.root, "uploads", &name);
+    std::fs::write(&dest, &bytes).map_err(|e| format!("{e}"))?;
+    let rel = dest
+        .strip_prefix(&state.root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| dest.to_string_lossy().into_owned());
+    register_artifact_at(&state, rel, None).await
+}
+
+#[tauri::command]
+async fn register_artifact(
+    state: State<'_, AppState>,
+    path: String,
+    content_type: Option<String>,
+) -> Result<ArtifactInfo, String> {
+    register_artifact_at(&state, path, content_type).await
 }
 
 /// Tell the webview whether we're in dev (keep native context menu / DevTools).
@@ -957,6 +1025,7 @@ pub fn run() {
             read_file,
             list_artifacts,
             read_artifact,
+            upload_file,
             register_artifact,
             get_project_info,
             get_capabilities,

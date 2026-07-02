@@ -65,6 +65,14 @@ export function tauriMock(): void {
             ];
           case "read_file":
             return { path: args?.path ?? "report.csv", mime: "text/csv", text: "a,b\n1,2", base64: null };
+          case "upload_file":
+            return {
+              id: "art-upload-1",
+              name: args?.filename ?? "upload.csv",
+              kind: "text/csv",
+              path: `uploads/${args?.filename ?? "upload.csv"}`,
+              ts: 1,
+            };
           case "set_settings":
           case "set_api_key":
             return null;

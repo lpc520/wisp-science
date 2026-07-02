@@ -30,6 +30,9 @@ extern "C" {
     async fn invoke_timeout(cmd: &str, args: JsValue, timeout_ms: u32) -> Result<JsValue, JsValue>;
     async fn listen(event: &str, cb: &js_sys::Function) -> JsValue;
     async fn mount_preview(kind: &str, el_id: &str, payload: &str) -> JsValue;
+    async fn upload_files(files: JsValue) -> JsValue;
+    #[wasm_bindgen(js_name = upload_input_files)]
+    async fn upload_input_files(input_id: &str) -> JsValue;
 }
 
 #[derive(Deserialize, Clone)]
@@ -54,6 +57,138 @@ enum ChatItem {
     Assistant(String),
     Reasoning(String),
     Tool { name: String, ok: Option<bool>, input: String, output: String },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ArtifactInfo {
+    id: String,
+    name: String,
+    kind: String,
+    path: String,
+    ts: i64,
+}
+
+#[derive(Clone)]
+enum ComposerAttachment {
+    Uploading { key: String, name: String },
+    Ready { key: String, name: String, path: String },
+    Error { key: String, name: String, error: String },
+}
+
+#[derive(Deserialize)]
+struct UploadFileResult {
+    ok: bool,
+    info: Option<ArtifactInfo>,
+    filename: Option<String>,
+    error: Option<String>,
+}
+
+fn composer_attachment_key(name: &str, idx: usize) -> String {
+    format!("att-{idx}-{name}")
+}
+
+fn parse_upload_results(v: JsValue) -> Vec<UploadFileResult> {
+    if v.is_null() || v.is_undefined() {
+        return vec![];
+    }
+    serde_wasm_bindgen::from_value(v).unwrap_or_default()
+}
+
+fn file_list_len(files: &JsValue) -> usize {
+    js_sys::Reflect::get(files, &JsValue::from_str("length"))
+        .ok()
+        .and_then(|n| n.as_f64())
+        .map(|n| n as usize)
+        .unwrap_or(0)
+}
+
+fn begin_uploads(attachments: RwSignal<Vec<ComposerAttachment>>, uploading: RwSignal<bool>, count: usize) {
+    if count == 0 {
+        return;
+    }
+    attachments.update(|items| {
+        for i in 0..count {
+            items.push(ComposerAttachment::Uploading {
+                key: format!("up-{}-{i}", js_sys::Date::now()),
+                name: String::new(),
+            });
+        }
+    });
+    uploading.set(true);
+}
+
+fn finish_uploads(
+    attachments: RwSignal<Vec<ComposerAttachment>>,
+    uploading: RwSignal<bool>,
+    results: Vec<UploadFileResult>,
+) {
+    uploading.set(false);
+    attachments.update(|items| {
+        items.retain(|a| !matches!(a, ComposerAttachment::Uploading { .. }));
+        for result in results {
+            let name = result
+                .info
+                .as_ref()
+                .map(|i| i.name.clone())
+                .or(result.filename.clone())
+                .unwrap_or_else(|| "file".into());
+            let key = composer_attachment_key(&name, items.len());
+            if result.ok {
+                if let Some(info) = result.info {
+                    items.push(ComposerAttachment::Ready { key, name, path: info.path });
+                }
+            } else {
+                items.push(ComposerAttachment::Error {
+                    key,
+                    name,
+                    error: result.error.unwrap_or_else(|| "Upload failed".into()),
+                });
+            }
+        }
+    });
+}
+
+fn queue_uploads(attachments: RwSignal<Vec<ComposerAttachment>>, uploading: RwSignal<bool>, files: JsValue) {
+    let count = file_list_len(&files);
+    begin_uploads(attachments, uploading, count);
+    spawn_local(async move {
+        finish_uploads(attachments, uploading, parse_upload_results(upload_files(files).await));
+    });
+}
+
+fn upload_from_input(
+    attachments: RwSignal<Vec<ComposerAttachment>>,
+    uploading: RwSignal<bool>,
+    input_id: &'static str,
+) {
+    uploading.set(true);
+    spawn_local(async move {
+        let v = upload_input_files(input_id).await;
+        finish_uploads(attachments, uploading, parse_upload_results(v));
+    });
+}
+
+fn attachment_paths(items: &[ComposerAttachment]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|a| match a {
+            ComposerAttachment::Ready { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn message_with_attachments(text: &str, paths: &[String]) -> String {
+    let body = text.trim();
+    if paths.is_empty() {
+        return body.to_string();
+    }
+    let files = paths.join(", ");
+    if body.is_empty() {
+        format!("Uploaded files: {files}")
+    } else {
+        format!("{body}\n\nUploaded files: {files}")
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1135,6 +1270,9 @@ fn App() -> impl IntoView {
 
     let items = create_rw_signal::<Vec<ChatItem>>(vec![]);
     let input = create_rw_signal(String::new());
+    let attachments = create_rw_signal::<Vec<ComposerAttachment>>(vec![]);
+    let uploading = create_rw_signal(false);
+    let drag_over = create_rw_signal(false);
     let busy = create_rw_signal(false);
     let show_settings = create_rw_signal(false);
     let settings = create_rw_signal(Settings::default());
@@ -1310,13 +1448,16 @@ fn App() -> impl IntoView {
 
     let send = move || {
         let text = input.get();
-        if text.trim().is_empty() || busy.get() { return; }
-        items.update(|v| { v.push(ChatItem::User(text.clone())); v.push(ChatItem::Assistant(String::new())); });
+        let paths = attachment_paths(&attachments.get());
+        let message = message_with_attachments(&text, &paths);
+        if message.trim().is_empty() || busy.get() || uploading.get() { return; }
+        items.update(|v| { v.push(ChatItem::User(message.clone())); v.push(ChatItem::Assistant(String::new())); });
         input.set(String::new());
+        attachments.set(vec![]);
         busy.set(true);
         let args = to_value(&SendArgs { message: "" }).unwrap();
         // Re-serialize with the real text (SendArgs borrows; build a fresh value).
-        let arg = to_value(&serde_json::json!({ "message": text })).unwrap();
+        let arg = to_value(&serde_json::json!({ "message": message })).unwrap();
         let _ = args;
         spawn_local(async move {
             if let Err(err) = invoke_checked("send_message", arg).await {
@@ -1330,6 +1471,50 @@ fn App() -> impl IntoView {
     let on_send = move |_ev: web_sys::KeyboardEvent| {
         if _ev.key() == "Enter" && !_ev.shift_key() { _ev.prevent_default(); send(); }
     };
+
+    let pick_files = move |_| {
+        if busy.get() || uploading.get() {
+            return;
+        }
+        let Some(window) = web_sys::window() else { return; };
+        let Some(doc) = window.document() else { return; };
+        let Some(el) = doc.get_element_by_id("composer-file-input") else { return; };
+        let _ = el.dyn_ref::<web_sys::HtmlElement>().map(|e| e.click());
+    };
+
+    let on_files_selected = move |_ev: web_sys::Event| {
+        if busy.get() || uploading.get() {
+            return;
+        }
+        upload_from_input(attachments, uploading, "composer-file-input");
+    };
+
+    let on_drag_over = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        if !busy.get() && !uploading.get() {
+            drag_over.set(true);
+        }
+    };
+
+    let on_drag_leave = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        drag_over.set(false);
+    };
+
+    let on_drop = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        drag_over.set(false);
+        if busy.get() || uploading.get() {
+            return;
+        }
+        if let Some(dt) = ev.data_transfer() {
+            if let Some(files) = dt.files() {
+                queue_uploads(attachments, uploading, files.into());
+            }
+        }
+    };
+
+    let composer_blocked = move || busy.get() || uploading.get();
 
     let check_updates = move |_| {
         if settings_busy.get() { return; }
@@ -1807,7 +1992,56 @@ fn App() -> impl IntoView {
             </div>
 
             <div class="composer">
-                <div class="composer-inner">
+                <div class="composer-inner"
+                    class:composer-dragover=move || drag_over.get()
+                    on:dragover=on_drag_over
+                    on:dragleave=on_drag_leave
+                    on:drop=on_drop>
+                    <input id="composer-file-input" type="file" multiple=true class="composer-file-input"
+                        on:change=on_files_selected />
+                    {move || (!attachments.get().is_empty()).then(|| view! {
+                        <div class="composer-attachments">
+                            {attachments.get().into_iter().map(|att| {
+                                let remove_key = match &att {
+                                    ComposerAttachment::Uploading { key, .. }
+                                    | ComposerAttachment::Ready { key, .. }
+                                    | ComposerAttachment::Error { key, .. } => key.clone(),
+                                };
+                                let att_view = match att {
+                                    ComposerAttachment::Uploading { name, .. } => {
+                                        let label = if name.is_empty() {
+                                            t(locale.get(), "composer.uploading").into()
+                                        } else {
+                                            name
+                                        };
+                                        view! { <span class="composer-attachment uploading">{label}</span> }.into_view()
+                                    }
+                                    ComposerAttachment::Ready { name, .. } => {
+                                        view! { <span class="composer-attachment ready">{name}</span> }.into_view()
+                                    }
+                                    ComposerAttachment::Error { name, error, .. } => {
+                                        view! {
+                                            <span class="composer-attachment error" title=error.clone()>{name}</span>
+                                        }.into_view()
+                                    }
+                                };
+                                view! {
+                                    <div class="composer-attachment-row">
+                                        {att_view}
+                                        <button type="button" class="composer-attachment-remove"
+                                            title=move || t(locale.get(), "composer.remove_attachment")
+                                            on:click=move |_| attachments.update(|items| {
+                                                items.retain(|a| match a {
+                                                    ComposerAttachment::Uploading { key, .. }
+                                                    | ComposerAttachment::Ready { key, .. }
+                                                    | ComposerAttachment::Error { key, .. } => key != &remove_key,
+                                                });
+                                            })>"×"</button>
+                                    </div>
+                                }
+                            }).collect_view()}
+                        </div>
+                    })}
                     <textarea
                         id="composer-input"
                         prop:value={move || input.get()}
@@ -1818,10 +2052,13 @@ fn App() -> impl IntoView {
                     <div class="composer-actions">
                         <span class="composer-hint">{move || t(locale.get(), "composer.hint")}</span>
                         <div class="composer-buttons">
+                            <button type="button" class="attach" disabled=composer_blocked
+                                title=move || t(locale.get(), "composer.attach")
+                                on:click=pick_files>{move || t(locale.get(), "composer.attach")}</button>
                             {move || busy.get().then(|| view! {
                                 <button type="button" class="stop" on:click=stop>{move || t(locale.get(), "composer.stop")}</button>
                             })}
-                            <button class="send" disabled={move || busy.get()} on:click=move |_| send()>{move || t(locale.get(), "composer.send")}</button>
+                            <button class="send" disabled=composer_blocked on:click=move |_| send()>{move || t(locale.get(), "composer.send")}</button>
                         </div>
                     </div>
                 </div>
